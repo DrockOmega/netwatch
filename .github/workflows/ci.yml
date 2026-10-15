@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.9.2
+      - run: ruff check .
+      - run: pip install mypy==2.4.0 bandit==1.9.4
+      - run: mypy --ignore-missing-imports --exclude '(^tests/|^console/|^packaging/)' .
+      # -lll (high severity) only for now; raise to -ll after triaging B608 and B104.
+      - run: bandit -q -r . -x ./tests,./console,./.venv -lll
+
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev libgl1 libegl1
+      # The security store refuses SQLite before 3.51.3 (WAL-reset corruption); the runners'
+      # Python links an older one (Ubuntu 24.04: 3.45.1), so every store-backed test errors.
+      - if: runner.os == 'Linux'
+        run: |
+          curl -fsSLo sqlite.tgz https://www.sqlite.org/2026/sqlite-autoconf-3540000.tar.gz
+          python -c "import hashlib,sys; sys.exit(hashlib.sha3_256(open('sqlite.tgz','rb').read()).hexdigest() != 'f5e3e724e9c9b3b5d512c76b02082091a59eeea9becd169a9fbf4d376403acce')"
+          tar xzf sqlite.tgz && cd sqlite-autoconf-3540000 && ./configure --prefix="$HOME/sqlite" > /dev/null && make -j4 > /dev/null && make install > /dev/null
+          echo "LD_LIBRARY_PATH=$HOME/sqlite/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.sqlite.org/2026/sqlite-dll-win-x64-3540000.zip -OutFile sqlite.zip
+          python -c "import hashlib,sys; sys.exit(hashlib.sha3_256(open('sqlite.zip','rb').read()).hexdigest() != 'f5fb500c73a3afd89976386bb8e4fdc8b5b65c052e187fb1ada1f5de034cd45b')"
+          if ($LASTEXITCODE) { throw "sqlite DLL checksum mismatch" }
+          Expand-Archive sqlite.zip -DestinationPath sqlite
+          Copy-Item sqlite\sqlite3.dll (Join-Path (Split-Path (Get-Command python).Source) "DLLs") -Force
+      - run: pip install -r requirements-dev.txt
+      - run: python -c "import sqlite3, netwatch_security_store as s; print(sqlite3.sqlite_version); assert s.sqlite_wal_safe()"
+      - run: python -m pytest
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit==2.7.3
+      # Scan the pinned runtime dependencies for known vulnerabilities (fails the job on any) and
+      # record what was resolved and scanned as a CycloneDX SBOM. No signing keys or secrets.
+      - run: pip-audit -r requirements.txt --format cyclonedx-json --output netwatch-sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netwatch-sbom
+          path: netwatch-sbom.cdx.json
+          if-no-files-found: error
+
+  console:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      # tauri generate_context! needs ../dist, which is gitignored.
+      - run: npm ci && npm run build
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: console/src-tauri
+      - run: rustup component add clippy
+      - run: cargo clippy --locked -- -D warnings
+        working-directory: console/src-tauri

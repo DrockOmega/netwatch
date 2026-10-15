@@ -1,0 +1,28 @@
+[project]
+name = "netwatch"
+version = "0.1.0"
+description = "A Windows desktop home-network IDS/IPS platform with live capture, incident correlation, and reversible response."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pyflakes (F), pycodestyle errors/warnings (E/W), isort (I), pyupgrade (UP),
+# flake8-bugbear (B). A pragmatic, not pedantic, baseline.
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines: the dashboard's HTML/QSS strings are intentionally wide
+]
+
+[tool.mypy]
+ignore_missing_imports = true
+exclude = '(^tests/|^console/|^packaging/)'

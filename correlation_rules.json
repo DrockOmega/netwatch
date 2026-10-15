@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "XS-002",
+      "version": 1,
+      "description": "NetWatch beacon corroborated by an IDS finding on the same flow",
+      "sources": ["DOD_CORE", "SURICATA"],
+      "join": "community_id",
+      "window_sec": 3600,
+      "match": {"action": ["BEACON_ANOMALY", "SURICATA_ALERT"]},
+      "attack": [{"technique": "T1071", "demonstrated": false}]
+    },
+    {
+      "id": "XS-003",
+      "version": 1,
+      "description": "NetWatch policy violation and an IDS finding on the same flow",
+      "sources": ["DOD_CORE", "SURICATA"],
+      "join": "community_id",
+      "window_sec": 3600,
+      "match": {"action": ["POLICY_DECISION", "SURICATA_ALERT"]},
+      "attack": []
+    },
+    {
+      "id": "XS-004",
+      "version": 1,
+      "description": "Two independent sources raise alert-level findings on the same local asset within ten minutes",
+      "sources": ["DOD_CORE", "SURICATA"],
+      "join": "asset",
+      "window_sec": 600,
+      "match": {"severity": ["alert", "critical"]},
+      "attack": []
+    }
+  ]
+}

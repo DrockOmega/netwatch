@@ -1,0 +1,5 @@
+# Runtime dependencies for NetWatch (Windows desktop app).
+# Pinned to the versions the app is developed and built against.
+# Note: Scapy capture also requires Npcap installed on the host (not a pip dep).
+PyQt6==6.11.0
+-r requirements-headless.txt

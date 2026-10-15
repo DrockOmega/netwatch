@@ -1,0 +1,65 @@
+# --- Build / packaging artifacts ---
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- IDE ---
+.idea/
+.vscode/
+
+# --- Runtime data (regenerated; not source) ---
+telemetry_ledger.db
+telemetry_ledger.db-shm
+telemetry_ledger.db-wal
+*.db
+*.db-shm
+*.db-wal
+telemetry_blocks.json
+telemetry_devices.json
+telemetry_baseline.json
+telemetry_arp.json
+telemetry_dns.json
+telemetry_ja3.json
+telemetry_quarantine.json
+telemetry_flows.jsonl*
+telemetry_policy_decisions.jsonl*
+threatintel_cache.json
+evidence/
+eve.json
+# ja3_blocklist.json IS committed (the curated/seedable known-bad fingerprint list).
+
+# oui_db.json IS committed: it is generated from the public, freely-redistributable
+# IEEE OUI registry (tools/refresh_oui_db.py), not licensed third-party data.
+
+# --- Logs (rotating, per-process) ---
+logs/
+
+# --- Config overlays ---
+# An overlay names a specific machine's NIC, delegated IPv6 prefix, and paths, so
+# it is local state, not source. netwatch.config.example.json documents the shape
+# and IS committed. Force-add an overlay (git add -f) if you deliberately want one
+# tracked for a shared host.
+netwatch.*.json
+!netwatch.config.example.json
+
+# --- Licensed third-party data: DO NOT COMMIT ---
+# MaxMind's GeoLite2 license prohibits redistribution. Each user downloads their
+# own copy (see README "GeoIP data"). Keeping it out of git avoids a license
+# violation in a public portfolio repo.
+GeoLite2-Country.mmdb
+*.mmdb
+telemetry_response_mode.json
+
+# --- Local review/audit tool output ---
+.audit/

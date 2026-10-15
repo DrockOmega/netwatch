@@ -1,0 +1,15 @@
+{
+  "rule": "XS-003",
+  "local_networks": ["192.168.1.0/24"],
+  "attack_demonstrated": [],
+  "detections": [
+    {"source": "DOD_CORE", "action": "POLICY_DECISION", "target_id": "198.51.100.23", "offset_sec": 0,
+     "data": {"source_event_id": "core-policy-1", "message": "POLICY BLOCK: block-cleartext-telnet-egress",
+              "severity": "alert", "rule_id": "block-cleartext-telnet-egress",
+              "community_id": "1:fJ8bS6sG2Y3w0VwUd6c3B3jbJ+o="}},
+    {"source": "SURICATA", "action": "SURICATA_ALERT", "target_id": "198.51.100.23", "offset_sec": 5,
+     "data": {"source_event_id": "eve-3", "message": "SURICATA ALLOWED: ET POLICY Telnet cleartext login", "severity": "alert",
+              "src_ip": "192.168.1.22", "src_port": 40001, "dst_ip": "198.51.100.23", "dst_port": 23,
+              "direction": "egress", "community_id": "1:fJ8bS6sG2Y3w0VwUd6c3B3jbJ+o="}}
+  ]
+}

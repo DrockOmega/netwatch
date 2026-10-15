@@ -1,0 +1,5 @@
+{
+  "domains": ["pornhub.com", "unknown-ip.ru", "malicious-c2.com"],
+  "countries": ["RU", "CN", "KP", "IR", "BY"],
+  "ports": [3389, 23, 21]
+}

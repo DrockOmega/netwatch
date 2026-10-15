@@ -1,0 +1,9 @@
+[Unit]
+Description=NetWatch owned-scope exposure scan and ingest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/netwatch-scan.sh
+Nice=10

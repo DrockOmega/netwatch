@@ -1,0 +1,16 @@
+# SSH local forward from the console host to one sensor's loopback-only service API.
+# %i is the ssh host alias; LOCAL_PORT comes from ~/.config/netwatch-gateway/%i.tunnel
+# A user unit: it starts at boot only with linger on (loginctl enable-linger <user>).
+# network-online.target does not exist in the user manager, so ordering on it did nothing;
+# Restart= covers a network that is not up yet.
+[Unit]
+Description=NetWatch tunnel to %i
+
+[Service]
+EnvironmentFile=%h/.config/netwatch-gateway/%i.tunnel
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:${LOCAL_PORT}:127.0.0.1:8765 %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
