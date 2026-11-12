@@ -298,7 +298,7 @@ def _run_backlog(tmp_path, count, poison=False, active=False):
                 pending = check.count_pending()['batches']
                 check.close()
                 stop.set()
-                # Replay is time-boxed per iteration; slow fsync (Windows) may leave a tail.
+                # Replay is time-boxed per iteration; a slow fsync may leave a tail.
                 assert pending <= count - 2
             raise queue.Empty
 

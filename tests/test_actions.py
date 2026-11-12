@@ -428,13 +428,13 @@ def test_service_does_not_construct_or_call_an_enforcing_effector(tmp_path, monk
             raise AssertionError(label + " constructed")
         return _init
 
-    monkeypatch.setattr(netwatch_mitigation.WindowsFirewall, "__init__", bomb("WindowsFirewall"))
+    monkeypatch.setattr(netwatch_mitigation.RecordingFirewall, "__init__", bomb("RecordingFirewall"))
     monkeypatch.setattr(netwatch_mitigation.Mitigator, "__init__", bomb("Mitigator"))
     monkeypatch.setattr(netwatch_quarantine.ArpQuarantineEffector, "__init__", bomb("ArpQuarantineEffector"))
     monkeypatch.setattr(netwatch_quarantine.Quarantine, "__init__", bomb("Quarantine"))
     monkeypatch.setattr(netwatch_quarantine.RecordingQuarantineEffector, "__init__", bomb("RecordingQuarantineEffector"))
 
-    secret = load_secret(tmp_path / "api.secret", create=True)  # before the bomb: icacls restricts it on Windows
+    secret = load_secret(tmp_path / "api.secret", create=True)
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("subprocess")))
     for name in ("io_sniffer_process", "dod_core_process", "db_persistence_worker", "durable_analysis_process"):
         monkeypatch.setattr(netwatch_runtime, name, idle_worker)
@@ -472,7 +472,7 @@ def test_service_does_not_construct_or_call_an_enforcing_effector(tmp_path, monk
         assert not (tmp_path / "telemetry_quarantine.json").exists()
         for name in ("netwatch_actions.py", "netwatch_api.py", "netwatch_runtime.py", "netwatch_service.py"):
             text = (ROOT / name).read_text()
-            for banned in ("WindowsFirewall", "ArpQuarantineEffector", "RecordingQuarantineEffector", "netsh", "sendp"):
+            for banned in ("RecordingFirewall", "ArpQuarantineEffector", "RecordingQuarantineEffector", "sendp"):
                 assert banned not in text, name
     finally:
         api.close()

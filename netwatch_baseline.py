@@ -82,6 +82,7 @@ class BaselineTracker:
         z_threshold=4.0,
         rel_floor=0.15,
         abs_floor=1.0,
+        key_floors=None,
         max_keys=512,
         ledger_path=None,
     ):
@@ -90,6 +91,7 @@ class BaselineTracker:
         self.z_threshold = z_threshold
         self.rel_floor = rel_floor      # min std as a fraction of |mean| (regularity guard)
         self.abs_floor = abs_floor      # absolute min std floor
+        self.key_floors = key_floors or {}  # key -> abs_floor override for that key
         self.max_keys = max_keys
         self.ledger_path = ledger_path
         self.models = {}        # key -> EwmaStat
@@ -116,7 +118,7 @@ class BaselineTracker:
 
         learning = stat.n < self.warmup
         # Robust spread: never let a hyper-regular device score on trivial jitter.
-        eff_std = max(stat.std, self.rel_floor * abs(stat.mean), self.abs_floor)
+        eff_std = max(stat.std, self.rel_floor * abs(stat.mean), self.key_floors.get(key, self.abs_floor))
         z = 0.0 if learning else (value - stat.mean) / eff_std
         anomaly = (not learning) and z > self.z_threshold  # one-sided: spikes only
 

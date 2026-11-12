@@ -24,7 +24,6 @@ def test_defaults_only(tmp_path, monkeypatch):
     assert cfg["RESPONSE_MODE"] == "ids_only"
     assert cfg["POLICY_MODE"] == "manual"
     assert cfg["MITIGATION_ENABLED"] is True
-    assert cfg["MITIGATION_DRY_RUN"] is False
     assert cfg["QUARANTINE_ENABLED"] is True
     assert cfg["QUARANTINE_DRY_RUN"] is False
     assert cfg["BPF_FILTER"] is None
@@ -51,7 +50,7 @@ def test_relative_paths_resolve_against_base_dir(tmp_path, monkeypatch):
             assert value.startswith(str(tmp_path)), key
 
 
-def test_missing_read_only_default_uses_frozen_resource_dir(tmp_path, monkeypatch):
+def test_missing_read_only_default_falls_back_to_the_code_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("NETWATCH_CONFIG", raising=False)
     install = tmp_path / "install"
     bundle = tmp_path / "bundle"

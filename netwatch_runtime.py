@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import multiprocessing as mp
 import queue
+import sys
 import threading
 import time
 
@@ -23,6 +24,7 @@ INGESTION_QUEUE_BATCHES = 128
 NATIVE_STOP_SEC = 10  # Share of the stop budget native collectors and analysis get before core/db drain.
 STOP_POLL_SEC = 0.01  # stop-signal poll period in wait(): a stop is seen within 10 ms
 MAX_PENDING_FINDINGS = 64  # ~32 min of continuous store refusal at the 30 s restart backoff
+PIPE_BYTES = 1 << 20  # ingest and merge queue pipes: ~10 full batches in flight; the default fs.pipe-max-size
 KILL_WAIT_SEC = 5  # SIGKILL wait for an uninterruptible disk wait; never unbounded.
 
 
@@ -62,14 +64,26 @@ class StopSignal:
                 return False
             # Every pipe touch is a non-blocking poll under the process-local lock (in is_set);
             # the wait itself is a plain sleep. Threads polling the one pipe concurrently stalled
-            # the sensor's capture loop ~32 s inside multiprocessing's Windows wait() (ov.cancel(),
-            # 2026-10-12 stall dump). No interprocess lock survives a dead worker.
+            # the sensor's capture loop ~32 s inside multiprocessing's wait() (2026-10-12 stall
+            # dump). No interprocess lock survives a dead worker.
             time.sleep(STOP_POLL_SEC if remaining is None else min(STOP_POLL_SEC, remaining))
         return True
 
     def close(self):
         self.reader.close()
         self.writer.close()
+
+
+def widen_pipe(ipc_queue, size=PIPE_BYTES):
+    """Linux: a 64 KiB pipe holds under one ~100 KB ingest batch, so the reader blocked mid-message on the
+    writer's feeder thread and a shard with a full queue sat ~20% idle. Best effort."""
+    if sys.platform.startswith("linux"):
+        import fcntl
+
+        try:
+            fcntl.fcntl(ipc_queue._writer.fileno(), fcntl.F_SETPIPE_SZ, size)  # type: ignore[attr-defined]
+        except OSError as exc:  # above fs.pipe-max-size or the user's pipe page budget: keep the default
+            log.warning("pipe size %d refused: %s", size, exc)
 
 
 def core_workers(config):
@@ -93,7 +107,7 @@ class MonitoringRuntime:
             raise RuntimeError("monitoring workers already started")
         self.shutdown_event = StopSignal(self.context)
         self.worker_stops = {name: StopSignal(self.context) for name in ("db", "sniffer", "core", "analysis",
-                                                                           "suricata-eve", *self.shard_names)}
+                                                                           "suricata-eve", "zeek", "wazuh", *self.shard_names)}
         self.capture_stop = StopSignal(self.context)
         self.capture_drained = StopSignal(self.context)
         sizes = {"ingestion": INGESTION_QUEUE_BATCHES, "render": 1000, "alert": 500, "policy": 500,
@@ -103,6 +117,9 @@ class MonitoringRuntime:
         for name in self.shard_names:  # sharded: capture -> shard ("ingestion-core-i"), shard -> merge ("merge-core-i")
             sizes[f"ingestion-{name}"] = sizes[f"merge-{name}"] = INGESTION_QUEUE_BATCHES
         self.queues = {name: self.context.Queue(maxsize=size) for name, size in sizes.items()}
+        for name in sizes:
+            if name.startswith(("ingestion", "merge-")):
+                widen_pipe(self.queues[name])
         q, config = self.queues, self.config
         stops = self.worker_stops
         self.sniffer_progress = self.context.RawValue("d", 0.0)  # capture loop's time.monotonic(); 0.0 = none yet
@@ -129,12 +146,22 @@ class MonitoringRuntime:
 
             specs.append(("suricata-eve", suricata_eve_process,
                           (q["alert"], q["evidence"], config, q["worker_status"], stops["suricata-eve"])))
+        if config.get("ZEEK_LOGS_ENABLED", False):
+            from netwatch_zeek import zeek_log_process
+
+            specs.append(("zeek", zeek_log_process, (q["alert"], config, q["worker_status"], stops["zeek"])))
+        if config.get("WAZUH_ALERTS_ENABLED", False):
+            from netwatch_wazuh import wazuh_alert_process
+
+            specs.append(("wazuh", wazuh_alert_process, (q["alert"], config, q["worker_status"], stops["wazuh"])))
         try:
             for name, target, args in specs:
                 transient = {"db": ("db_status",), "sniffer": ("worker_status",),
                              "core": ("render", "alert", "policy", "worker_status", "inventory"),
                              "analysis": ("alert", "worker_status"),
-                             "suricata-eve": ("alert", "worker_status")}.get(name, ("render", "worker_status"))
+                             "suricata-eve": ("alert", "worker_status"),
+                             "zeek": ("alert", "worker_status"),
+                             "wazuh": ("alert", "worker_status")}.get(name, ("render", "worker_status"))
                 process = self.context.Process(target=worker_entrypoint, name=name,
                                                args=(target, args, stops[name], tuple(q[key] for key in transient),
                                                      name != "sniffer"), daemon=True)
@@ -171,10 +198,14 @@ class MonitoringRuntime:
             # The native source collector and durable analysis stop first: store consumers whose work is
             # committed with SQLite cursors; analysis still needs capture alive for its evidence requests.
             self.worker_stops["suricata-eve"].set()
+            self.worker_stops["zeek"].set()
+            self.worker_stops["wazuh"].set()
             self.worker_stops["analysis"].set()
             # A hung collector must not spend core/db's drain budget (VM: a collector in fdatasync ate all 60 s).
             native_deadline = min(deadline, time.monotonic() + NATIVE_STOP_SEC)
             finish("suricata-eve", native_deadline)
+            finish("zeek", native_deadline)
+            finish("wazuh", native_deadline)
             finish("analysis", native_deadline)
             self.capture_stop.set()
             clean_capture = self.capture_drained.wait(max(0, deadline - time.monotonic()))
@@ -236,7 +267,7 @@ class ServiceSupervisor:
     """Restart a failed generation; never reuse queues after a process crash."""
 
     def __init__(self, config):
-        self.runtime = MonitoringRuntime(config)
+        self.runtime = MonitoringRuntime(dict(config, _RENDER_ROWS=False))  # no window reads render rows
         self.store = security_store_from_config(config)
         # Recording owner only. Wall-clock expiry is independent of the monotonic tick.
         self.actions = service_actions(self.store, config)

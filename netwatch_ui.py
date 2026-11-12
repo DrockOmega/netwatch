@@ -2285,9 +2285,9 @@ class OperationsDashboard(QMainWindow):
         if not self.config.get("MITIGATION_ENABLED"):
             return None
         try:
-            from netwatch_mitigation import DEFAULT_ALLOWLIST_PREFIXES, Mitigator, WindowsFirewall
+            from netwatch_mitigation import DEFAULT_ALLOWLIST_PREFIXES, Mitigator, RecordingFirewall
 
-            firewall = WindowsFirewall(dry_run=bool(self.config.get("MITIGATION_DRY_RUN", True)))
+            firewall = RecordingFirewall()
             protected_v4 = tuple(dict.fromkeys(
                 (*DEFAULT_ALLOWLIST_PREFIXES, *self.config.get("LOCAL_PREFIXES", ()))
             ))
@@ -2496,7 +2496,7 @@ class OperationsDashboard(QMainWindow):
             self.btn_unblock.setEnabled(True)
             mode = {"ignore": "STANDBY", "queue": "READY", "enforce": "AUTO"}[dispatch]
             run = "DRY RUN" if getattr(self.mitigator.effector, "dry_run", False) else "LIVE"
-            self.mit_status.setText(f"{mode} · {run} · watcher initialized · reversible Windows Firewall controls")
+            self.mit_status.setText(f"{mode} · {run} · watcher initialized · recording-only effector")
             now = time.time()
             self._repopulate_list(self.pending_list, [
                 (ip, f"{ip}   {str(meta.get('reason', ''))[:70]}")

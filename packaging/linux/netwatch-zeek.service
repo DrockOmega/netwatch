@@ -1,0 +1,47 @@
+# Zeek (AF_PACKET) for NetWatch, beside netwatch-suricata on the same mirror NIC. Zeek 8 LTS from the
+# security:zeek OBS repo (install-zeek.sh). Capture interface: NW_IFACE in /etc/netwatch/sensor.env.
+[Unit]
+Description=Zeek network monitor for NetWatch (AF_PACKET)
+After=network.target
+
+[Service]
+Type=simple
+User=zeek
+Group=zeek
+Environment=NW_IFACE=eth0
+EnvironmentFile=-/etc/netwatch/sensor.env
+WorkingDirectory=/var/lib/zeek/logs
+ExecStartPre=/opt/zeek/bin/zeek -a /etc/netwatch/zeek/netwatch.zeek
+# Zeek truncates a leftover live <log>.log on start (its shutdown leaves a short final file), which NetWatch's
+# reader sees as a rewrite (collector_gap). Renaming keeps the inode, so the reader finishes it under the new name.
+ExecStartPre=/bin/sh -c 'cd /var/lib/zeek/logs && t=$(date +%%Y-%%m-%%d-%%H-%%M-%%S) && for f in *.log; do case "$f" in *.*.log) ;; *) [ -s "$f" ] && mv -n "$f" "$${f%%.log}.$t-restart.log" ;; esac; done; true'
+ExecStart=/opt/zeek/bin/zeek -i af_packet::${NW_IFACE} /etc/netwatch/zeek/netwatch.zeek
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Logs are group-readable so the netwatch user (SupplementaryGroups=zeek) can tail them.
+UMask=0027
+StateDirectory=zeek zeek/logs
+StateDirectoryMode=0750
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

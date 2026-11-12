@@ -24,10 +24,10 @@ VERIFICATION = "active nmap scan of an owned scope; open port observed"
 
 
 def _open_findings(conn, asset_id):
-    """Open exposure findings for one asset, keyed by (protocol, port)."""
+    """Exposure findings for one asset, keyed by (protocol, port); an open finding wins over a resolved one."""
     rows = conn.execute("SELECT finding_id, body FROM security_exposure_findings WHERE asset_id=?", (asset_id,))
-    bodies = [(r["finding_id"], json.loads(r["body"])) for r in rows]
-    return {(b["protocol"], b["port"]): (fid, b) for fid, b in bodies if b.get("status") == "open"}
+    bodies = sorted(((r["finding_id"], json.loads(r["body"])) for r in rows), key=lambda fb: fb[1].get("status") == "open")
+    return {(b["protocol"], b["port"]): (fid, b) for fid, b in bodies}
 
 
 def _drift(store, action, ip, ref, port_key, severity, message):
@@ -54,12 +54,18 @@ def _record_drift(store, out, ip, ref, t, new_host, before, seen, probed):
         _drift(store, "EXPOSURE_NEW_HOST", ip, ref, min(seen), "alert", f"New host {ip} with {len(seen)} open service(s)")
         out["drift"].append(("new_host", ip))
     elif not new_host:
-        for key in sorted(seen - before.keys()):
+        open_now = {key for key, (_, body) in before.items() if body.get("status") == "open"}
+        for key in sorted(seen - open_now):
+            # A service this host had open before (closed by an earlier rescan, e.g. a TV in standby) is not new.
+            if key in before:
+                _drift(store, "EXPOSURE_SERVICE_REOPENED", ip, ref, key, "info", f"Open service {key[0]}/{key[1]} on {ip} reopened")
+                out["drift"].append(("reopened", ip, *key))
+                continue
             _drift(store, "EXPOSURE_NEW_SERVICE", ip, ref, key, "alert", f"New open service {key[0]}/{key[1]} on {ip}")
             out["drift"].append(("new_service", ip, *key))
     for key, (fid, body) in sorted(before.items()):
         # Only a service this scanner saw open, on a host and port this scan probed, counts as remediated.
-        if key not in seen and probed(key) and "NMAP" in body.get("sources", []):
+        if body.get("status") == "open" and key not in seen and probed(key) and "NMAP" in body.get("sources", []):
             body |= {"status": "resolved", "resolved_at": t, "verification": "rescan of an owned scope; port no longer open"}
             store.conn.execute("UPDATE security_exposure_findings SET body=? WHERE finding_id=?", (_encode(body), fid))
             _drift(store, "EXPOSURE_SERVICE_CLOSED", ip, ref, key, "info",

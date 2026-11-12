@@ -292,6 +292,13 @@ def test_exfil_targets_the_external_destination_never_the_lan_sender(tmp_path):
     assert inbound == []  # a download is not exfiltration
 
 
+def test_exfil_alert_carries_sender_mac(tmp_path):
+    from tests.test_capture import SRC_MAC
+    [alert] = _alerts(tmp_path, _events(6, "192.168.1.10", "1.1.1.1", n=5, payload=b"x" * 1000),
+                      {"EXFIL_THRESHOLD_BYTES": 2000}, "by ")
+    assert alert["data"]["src_mac"] == ":".join(f"{b:02x}" for b in SRC_MAC)
+
+
 
 def test_exfil_window_exempts_only_its_device_networks_and_hours(tmp_path):
     from tests.test_capture import SRC_MAC
@@ -405,3 +412,15 @@ def test_geo_fault_is_counted_in_the_one_second_log_and_row_keeps_placeholder(tm
     rows = [row for m in drain(qs["db"]) for row in m["data"].get("rows", [])]
     assert len(rows) == 1 and "--" in rows[0]  # one destination: 5 packets, one cached fault
     assert any("geo faults: 1" in m for m in messages)
+
+
+def test_dns_answer_to_an_ephemeral_restricted_port_is_not_a_threat_port(tmp_path):
+    from tools.bench_core_shard import _dns
+
+    def answer(name, payload):
+        (tmp_path / name).mkdir()
+        events = _events(17, "1.1.1.1", "192.168.1.10", dports=(3389,), payload=payload, sport=53)
+        return _alerts(tmp_path / name, events, None, "THREAT PORT")
+
+    assert answer("dns", _dns("rdktel.stb.r53.xcal.tv", response=True)) == []
+    assert answer("raw", b"not dns, aimed at rdp from port 53")  # the source port alone excuses nothing

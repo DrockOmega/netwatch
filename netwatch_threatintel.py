@@ -30,7 +30,9 @@ _JA3_RE = re.compile(r"^[0-9a-f]{32}$")
 # Feed JA3 entries known to match benign clients here; dropped wherever an IndicatorSet is built.
 # 40adfd92...: an SSLBL entry that matched Samsung TV/phone TLS to Samsung, Apple and YouTube CDNs
 # (triaged 2026-10-13); still in the SSLBL list after a refresh.
-JA3_FEED_IGNORE = frozenset({"40adfd923eb82b89d8836ba37a19bca1"})
+# 1aee0238...: SSLBL "Tofsee" (last seen 2021-07-30); matched only a Samsung TV's UEI QuickSet component
+# (reverselookup.quicksetcloud.com, www.ueiwsp.com) on the sensor (2026-10-16).
+JA3_FEED_IGNORE = frozenset({"40adfd923eb82b89d8836ba37a19bca1", "1aee0238942d453d679fc1e37a303387"})
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9_-]{1,63}\.)+[a-z]{2,}$")
 
 

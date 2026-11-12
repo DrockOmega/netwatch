@@ -1,6 +1,6 @@
 # NetWatch — Home Network Monitoring & Mitigation
 
-A Windows desktop tool that captures live network traffic, runs real-time
+A Linux tool that captures live network traffic, runs real-time
 anomaly detection, and presents it through an incident-first detection and
 response console.
 Built as a study in defensive security engineering: process isolation, a strict
@@ -14,7 +14,7 @@ IPC contract, allocation-free hot paths, and a hardened UI boundary.
 
 ## What it does
 
-- **Live capture** of Ethernet traffic via Scapy/Npcap, with SNI (TLS ClientHello) and
+- **Live capture** of Ethernet traffic via Scapy/libpcap, with SNI (TLS ClientHello) and
   DNS query-name extraction.
 - **Real-time detectors**, all running per-source/per-destination over a
   pre-allocated memory arena:
@@ -60,9 +60,9 @@ IPC contract, allocation-free hot paths, and a hardened UI boundary.
 - **Secure-node exclusion**: an on-demand Traffic filter hides operator-defined
   source nodes by IP or MAC while retaining traffic they send to trusted systems.
   A separate endpoint-wide mode is available when both sides should disappear.
-- **Active mitigation**: turn an alert into a reversible Windows
-  Firewall block on a bad external IP, with an allowlist, auto-expiry, a capacity
-  cap, and a manual-approval gate. See [Mitigation](#mitigation).
+- **Mitigation ledger**: turn an alert into a recorded, reversible block request
+  on a bad external IP, with an allowlist, auto-expiry, a capacity cap, and a
+  manual-approval gate. No host firewall is changed. See [Mitigation](#mitigation).
 - **Active LAN quarantine**: sever a misbehaving *local* device via ARP
   isolation from this host — enforcement that works behind a locked ISP gateway,
   with dry-run, auto-expiry, heal-on-release, and a manual-approval gate. See
@@ -91,7 +91,7 @@ io_sniffer_process ──ingestion_queue──▶ dod_core_process ──render_
                                               └──db_queue────────────────▶ db_persistence_worker ──db_status_queue──▶ UI
 ```
 
-- **`io_sniffer_process`** — owns the Npcap handle (`full` captures every Ethernet
+- **`io_sniffer_process`** — owns the libpcap handle (`full` captures every Ethernet
   frame; optional `balanced` excludes small bare TCP ACKs),
   applies a 256 MiB kernel buffer (`PCAP_BUFFER_BYTES`), and parses raw Ethernet frames without building
   a Scapy object graph per packet. It extracts SNI / DNS metadata / JA3-JA3S and
@@ -163,12 +163,12 @@ bug. Plan placement accordingly.
 
 ## Setup
 
-Requires Windows, Python ≥ 3.12, and **[Npcap](https://npcap.com/)** installed
-(for raw capture). Must be run **elevated** (raw sockets need admin).
+Requires Linux, Python ≥ 3.12 and libpcap. Capture needs CAP_NET_RAW (run under
+`sudo`, or as the sensor's `netwatch.service`; see `packaging/linux/INSTALL.md`).
 
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 ### GeoIP data (not bundled)
@@ -176,32 +176,24 @@ python -m venv .venv
 The MaxMind GeoLite2 license prohibits redistribution, so the `.mmdb` is not in
 this repo. Download `GeoLite2-Country.mmdb` from your (free) MaxMind account and
 place it in the project root. Without it the app still runs; every packet just
-gets country `--`.
+gets country `--`. `GeoLite2-City.mmdb` (or DB-IP's free City Lite, set as `GEO_CITY_DB`) feeds the console's WAN map; without it the map stays empty.
 
 ### Configure
 
 Copy [`netwatch.config.example.json`](netwatch.config.example.json) to
 `netwatch.config.json` and set at minimum `NIC_INTERFACE` to your adapter's
-name as Npcap reports it. See [Configuration](#configuration) for the full
+name (`ip -br link`). See [Configuration](#configuration) for the full
 layering model — you should not need to edit source to configure a host.
 
-```powershell
-copy netwatch.config.example.json netwatch.config.json
-# list adapter names/descriptions Npcap will accept:
-python -c "from scapy.arch.windows import get_windows_if_list; [print(i['name'],'|',i['description']) for i in get_windows_if_list()]"
+```sh
+cp netwatch.config.example.json netwatch.config.json
+ip -br link   # capture interface names
 ```
 
 ### Run
 
-```powershell
-# from an elevated shell
-.venv\Scripts\python.exe main.py
-```
-
-### Build a standalone exe
-
-```powershell
-pyinstaller main.spec   # one-dir build, UAC-elevated, bundles data files
+```sh
+sudo .venv/bin/python main.py
 ```
 
 ## Configuration
@@ -215,7 +207,7 @@ netwatch_config.DEFAULTS  ->  netwatch.config.json  ->  netwatch.<hostname>.json
 Each layer is a shallow JSON overlay naming only the keys it changes. Unknown
 keys are reported at boot and ignored (a typo cannot silently do nothing); keys
 starting with `_` are treated as annotations, since JSON has no comments.
-Relative paths resolve next to `main.py` (or the frozen exe); absolute paths are
+Relative paths resolve next to `main.py`; absolute paths are
 used verbatim. Overlays are gitignored — they name one machine's NIC and paths.
 
 Two values are discovered automatically when you do not set them:
@@ -283,7 +275,7 @@ the MAC's OUI, and raises a **new-device** notice the first time it sees a MAC.
 
 - **Vendor resolution** uses `oui_db.json`, generated from the public, freely
   redistributable IEEE OUI registry. Refresh it any time:
-  ```powershell
+  ```sh
   python tools/refresh_oui_db.py     # ~40k vendors; falls back to a curated seed offline
   ```
 - **Randomized MACs** (modern phones with MAC privacy) are detected via the
@@ -297,7 +289,7 @@ they are informational, never a mitigation trigger).
 
 ### Inventory CLI
 
-```powershell
+```sh
 python devices.py list                 # table: MAC, vendor, packet count, last seen, IPs
 python devices.py list --sort count    # busiest devices first (also: last, first, mac)
 python devices.py list --json          # machine-readable
@@ -325,7 +317,7 @@ a global threshold.
 
 ### Baseline CLI
 
-```powershell
+```sh
 python baseline.py list                 # learned per-device baseline (mean/std/windows)
 python baseline.py list --sort mean      # biggest talkers first
 python baseline.py list --json
@@ -377,7 +369,7 @@ would pair it with a public-suffix list and a threat-intel feed (roadmap).
 
 ### DNS CLI
 
-```powershell
+```sh
 python dns.py list       # per-host summary: queries, NXDOMAIN, DGA, tunnel counts
 python dns.py recent     # recently flagged domains (DGA / tunnel) with scores
 ```
@@ -407,7 +399,7 @@ server side.
 
 ### JA3 CLI
 
-```powershell
+```sh
 python ja3.py list                  # fingerprint inventory (JA3 + JA3S), most-seen first
 python ja3.py list --blocklisted    # only blocklist hits
 ```
@@ -422,12 +414,12 @@ Spamhaus DROP.
 cache (`threatintel_cache.json`). A separate operator step does the fetching, like
 updating antivirus signatures:
 
-```powershell
+```sh
 python threatintel_update.py update     # fetch feeds -> rebuild the local cache
 python threatintel_update.py status      # show what's cached (per-source counts)
 ```
 
-Schedule `update` with Windows Task Scheduler (or cron) to keep it fresh. A feed
+Schedule `update` with a systemd timer (`netwatch-threatintel.timer`) to keep it fresh. A feed
 that fails to fetch is skipped, and the cache is only overwritten when at least one
 feed yields indicators, so an outage can't wipe your protection.
 
@@ -448,7 +440,7 @@ shows a gap-preserving 60-minute activity chart and top sources, and can isolate
 IPv4 or IPv6. The live stream has the same address-family filter and renders full
 compressed IPv6 source addresses instead of forcing them into an IPv4-width column.
 
-```powershell
+```sh
 python history.py summary                                  # totals, sources, span
 python history.py query --since 1h --proto TCP --port 443  # filtered event list
 python history.py query --domain anthropic --src 10.0.0.5
@@ -475,21 +467,10 @@ it cannot "auto-footgun":
   restart and stale ones are cleaned up on the next boot.
 - **Manual-approval gate** — in the default `IDS + IPS READY` mode an alert only *queues*
   a block; nothing happens until you approve it. Auto mode blocks immediately.
-- **Live by default** — approval creates the real rule; `MITIGATION_DRY_RUN=true`
-  remains available for simulation.
+- **Nothing enforced** — the effector is `RecordingFirewall`: it records each
+  block and unblock and changes no host firewall, so the panel shows DRY RUN.
 
-The policy/ledger logic is pure and unit-tested; the `netsh` effector is injected
-(tests use a fake and never touch the real firewall).
-
-### Operator CLI
-
-```powershell
-python mitigate.py list                                   # active blocks
-python mitigate.py block 203.0.113.7 --reason scan        # dry-run preview
-python mitigate.py --apply block 203.0.113.7 --reason scan # actually block (admin)
-python mitigate.py --apply reconcile                      # lift expired blocks
-python mitigate.py --apply unblock 203.0.113.7
-```
+The policy/ledger logic is pure and unit-tested; the effector is injectable.
 
 ### In-dashboard control panel
 
@@ -563,7 +544,7 @@ The **MITIGATION CONTROL** panel gains a **LAN QUARANTINE** section:
 
 ### Operator CLI
 
-```powershell
+```sh
 python quarantine.py list
 python quarantine.py hold 10.0.0.34 --gateway 10.0.0.1 --reason "rogue IoT"   # dry-run
 python quarantine.py hold 10.0.0.34 --gateway 10.0.0.1 --apply                # elevated: on the wire
@@ -603,8 +584,8 @@ already deleted, unobserved files cannot be recovered. [Suricata EVE output](htt
 
 ## Development
 
-```powershell
-.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```sh
+.venv/bin/python -m pip install -r requirements-dev.txt
 python -m pytest        # unit tests for detectors + IPC contract
 ruff check .            # lint
 pip-audit -r requirements.txt   # dependency vulnerability scan
@@ -644,12 +625,10 @@ are maintained in [`docs/IPS_IMPLEMENTATION.md`](docs/IPS_IMPLEMENTATION.md).
 - Notification path (webhook / ntfy / toast) and incident correlation
 - ✅ Coalesced bounded pre/post-event PCAP capture with asynchronous disk writes
 - ✅ Optional durable Suricata native EVE ingestion, direction-aware findings and engine freshness
-- WinDivert shadow/inline laboratory enforcement with fail-open watchdog
-- Signed WFP callout driver for production-grade Windows inline enforcement
 
 **Mitigation (engine + UI shipped; see [Mitigation](#mitigation)):**
-- ✅ Block-on-alert via Windows Firewall with auto-expiry, allowlist, capacity
-  cap, manual-approval gate, dry-run, and a persisted ledger + operator CLI
+- ✅ Block-on-alert ledger (recorded, not enforced) with auto-expiry, allowlist,
+  capacity cap, manual-approval gate and a persisted ledger
 - ✅ In-dashboard approve/deny/unblock panel with live TTL countdown
 - ✅ Device quarantine workflow: ARP-poison isolation of a LAN device from this
   host — enforcement that works behind a locked ISP gateway (engine + CLI +
@@ -767,15 +746,13 @@ python -m netwatch_service --base-dir /absolute/path/to/runtime-data
 
 A new service environment can install `requirements-headless.txt`; its pinned
 dependencies exclude Qt and OpenGL. Capture still requires host capture privileges
-and Npcap/libpcap.
+and libpcap.
 
 The directory uses the same configuration overlays and resource-path rules as the
 desktop. Start with the desktop profile stopped; a process-lifetime ledger lock
 prevents both profiles from collecting into the same runtime concurrently.
-Interrupt or terminate the service for bounded shutdown. On the Windows sensor it runs as the
-boot task `NetWatchService`; an ordered stop is the file
-`C:\ProgramData\NetWatch\netwatch.stop`. The task runs at normal priority
-(`Settings.Priority` 4); the scheduler default of 7 is below normal and starves capture under load.
+Interrupt or terminate the service for bounded shutdown. On the sensor it runs as
+`netwatch.service`; `systemctl restart netwatch` is an ordered drain.
 
 The supervisor replaces a crashed or stalled worker generation with fresh queues,
 records a collection-gap incident for potentially missing queued telemetry, and
@@ -792,7 +769,7 @@ the intent and does not enforce, so readback stays unverified. The existing loca
 GUI response profile is still available when the service is stopped.
 
 The JSON API is bearer-authenticated on loopback (`127.0.0.1:8765`) with a 5 s
-whole-request deadline; on Windows `service-api.secret` is restricted with `icacls`.
+whole-request deadline; `service-api.secret` must be mode 0600.
 A separate console host reaches it through an SSH-tunnelled gateway. Central
-API/storage (PostgreSQL) was removed. Windows load, soak and live enforcement
+API/storage (PostgreSQL) was removed. Load, soak and live enforcement
 remain unverified.

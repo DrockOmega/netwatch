@@ -179,3 +179,20 @@ button.danger { background: var(--bad); border-color: var(--bad); color: #fff; f
 .terminal-resize { position: absolute; top: -4px; left: 0; right: 0; height: 8px; cursor: ns-resize; z-index: 1; }
 .terminal-resize:hover { background: var(--accent); opacity: 0.4; }
 .terminal-host { flex: 1; min-height: 0; }
+
+.geomap svg { width: 100%; height: auto; display: block; }
+.geomap .mapwrap { position: relative; }
+.geomap .pt.hot { fill-opacity: 1; stroke: var(--text); stroke-width: 1.5; }
+.geomap .tip { position: absolute; pointer-events: none; white-space: nowrap; z-index: 2; padding: 6px 8px; border-radius: 4px;
+  background: var(--panel); border: 1px solid var(--panel-edge); color: var(--text); font-size: 12px; line-height: 1.4; }
+.geomap .tip .flag { color: var(--warn); }
+.geomap .tip .muted { color: var(--muted); }
+.geomap .credit { fill: var(--muted); font-size: 11px; }
+.geomap .land { fill: var(--panel-edge); stroke: none; }
+.geomap .pt { fill-opacity: 0.7; stroke: none; }
+.geomap .pt.out { fill: var(--ok); }
+.geomap .pt.in { fill: var(--bad); }
+.geomap .pt.flagged { fill-opacity: 0.95; stroke: var(--warn); stroke-width: 1.5; }
+.geomap .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; }
+.geomap .dot.out { background: var(--ok); }
+.geomap .dot.in { background: var(--bad); }

@@ -5,8 +5,8 @@ app runs detached (which is the point of a monitor). This gives each of the four
 processes a rotating file plus the console it may or may not have.
 
 One file *per component* on purpose: ``RotatingFileHandler`` rotation is not
-multi-process safe on Windows — concurrent rotation of a shared file fails on the
-open handle. Separate files sidestep it entirely.
+multi-process safe — two processes rotating one shared file lose or interleave
+records. Separate files sidestep it entirely.
 """
 
 import logging

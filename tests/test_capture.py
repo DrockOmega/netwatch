@@ -8,8 +8,6 @@ packets, and never reports nonsense when the counters restart.
 import ipaddress
 import struct
 
-import pytest
-
 from netwatch_capture import (
     CaptureHealth,
     DropTracker,
@@ -313,15 +311,11 @@ def test_linux_capture_ring_is_sized_before_activation(monkeypatch):
 
     import scapy.config
     import scapy.layers.l2  # noqa: F401
-    try:
-        from scapy.libs import winpcapy
-    except OSError:  # Windows without Npcap: loading winpcapy needs wpcap.dll
-        pytest.skip("Npcap (wpcap.dll) not installed")
+    from scapy.libs import winpcapy
 
     calls = []
     monkeypatch.setattr(winpcapy, "pcap_set_buffer_size", lambda h, n: calls.append(("size", n)) or 0)
     monkeypatch.setattr(winpcapy, "pcap_activate", lambda h: calls.append(("activate",)) or 0)
-    monkeypatch.setattr("sys.platform", "linux")
 
     def listen(**kw):
         winpcapy.pcap_activate("handle")  # what Scapy's pcap wrapper does inside L2listen

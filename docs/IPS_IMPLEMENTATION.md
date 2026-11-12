@@ -12,11 +12,9 @@ outages.
 
 | Stage | Capability | Enforcement boundary | Acceptance gate | Status |
 |---|---|---|---|---|
-| 1 | Bidirectional flow/session model, beaconing, JA4, ordered policy, durable decision audit, capture-on-alert | Existing reversible Windows Firewall and LAN quarantine | Unit tests, policy monitor mode, bounded storage, no packet-path regression | Implemented |
+| 1 | Bidirectional flow/session model, beaconing, JA4, ordered policy, durable decision audit, capture-on-alert | Recording-only response actions and LAN quarantine | Unit tests, policy monitor mode, bounded storage, no packet-path regression | Implemented |
 | 2 | Suricata signatures, stream reassembly, application parsers, file metadata through EVE JSON | Suricata sensor or inline bridge | EVE replay corpus, rule provenance, alert deduplication, sensor health | Adapter implemented; sensor deployment optional |
-| 3 | Windows inline laboratory mode | WinDivert user-mode drop/reinject adapter | Shadow-versus-inline verdict parity, watchdog fail-open, latency and loss budgets | Planned |
-| 4 | Production Windows inline mode | Signed WFP callout driver plus least-privileged policy service | Driver signing, crash isolation, bypass policy, soak/load/fuzz testing | Planned |
-| 5 | Distributed commercial control plane | Multiple sensors with signed policy bundles and HA | RBAC, immutable audit, policy rollout/rollback, sensor failover | Planned |
+| 3 | Distributed commercial control plane | Multiple sensors with signed policy bundles and HA | RBAC, immutable audit, policy rollout/rollback, sensor failover | Planned |
 
 ## Implemented control-plane contract
 
@@ -48,10 +46,6 @@ outages.
 
 ## Remaining inline requirements
 
-- A WinDivert prototype must expose one explicit shadow/monitor/enforce state
-  machine and automatically bypass when its policy service or watchdog fails.
-- A WFP implementation must move packet verdicts into a signed callout driver;
-  the GUI must never sit in the kernel decision loop.
 - TCP reassembly, IP normalization, application parsing, signature evaluation,
   and file metadata should come from Suricata rather than bespoke Python.
 - Every ruleset update requires provenance, validation, staged activation,

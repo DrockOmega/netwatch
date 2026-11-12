@@ -8,7 +8,7 @@ not share one checkout without editing source. This module makes it data:
 
 Each layer is a shallow JSON overlay on the one before it, so an overlay only
 names the keys it changes. Relative paths in path-shaped keys are resolved
-against the base directory (next to the script / frozen exe).
+against the base directory (next to the script).
 
 Also here: the two pieces of network self-discovery the config depends on — the
 default gateway (so ARP rebinds of *the* gateway can be escalated) and the host's
@@ -20,7 +20,6 @@ import ipaddress
 import json
 import os
 import socket
-import subprocess
 from typing import Any
 
 from netwatch_core import DISK_MIN_FREE_BYTES, compile_networks
@@ -29,11 +28,11 @@ from netwatch_core import DISK_MIN_FREE_BYTES, compile_networks
 # against the base dir so an overlay can say "telemetry.db" and mean "next to the
 # app", while an absolute value is honoured verbatim.
 PATH_KEYS = (
-    "DB_NAME", "INCIDENT_DB", "SIG_FILE", "GEO_DB", "OUI_DB", "DEVICE_LEDGER", "BASELINE_LEDGER",
+    "DB_NAME", "INCIDENT_DB", "SIG_FILE", "GEO_DB", "GEO_CITY_DB", "OUI_DB", "DEVICE_LEDGER", "BASELINE_LEDGER",
     "DNS_LEDGER", "JA3_LEDGER", "JA3_BLOCKLIST", "THREATINTEL_CACHE",
     "BLOCK_LEDGER", "QUARANTINE_LEDGER", "RESPONSE_MODE_LEDGER", "LOG_DIR",
     "POLICY_FILE", "POLICY_DECISION_LEDGER", "EVIDENCE_DIR",
-    "SURICATA_EVE_PATH", "SPOOL_PATH", "CORRELATION_RULES",
+    "SURICATA_EVE_PATH", "SPOOL_PATH", "CORRELATION_RULES", "WAZUH_ALERTS_PATH",
 )
 
 BUNDLED_RESOURCE_KEYS = frozenset({"SIG_FILE", "OUI_DB", "JA3_BLOCKLIST", "POLICY_FILE", "CORRELATION_RULES"})
@@ -42,6 +41,20 @@ CAPTURE_PROFILES = {
     "full": None,  # No kernel exclusions: control planes, tags and fragments survive.
     "balanced": "not (tcp and len < 80 and tcp[13] == 0x10)",
 }
+
+
+def bulk_shed_filter(size):
+    """Kernel clause dropping frames over ``size`` bytes that carry bulk payload: a TCP segment (not port 53)
+    with no SYN/FIN/RST that does not start a TLS handshake record, or a UDP/443 QUIC short-header packet,
+    unfragmented IPv4 or extension-free IPv6. netwatch_core.bulk_shed_flow names the flows whose volume
+    then comes from Zeek. ``size`` >= 256 keeps every payload byte read inside the frame (a BPF read past
+    the end drops the frame)."""
+    return (f"not (len > {size} and ("
+            "(ip[9] == 6 and ip[6:2] & 0x3fff == 0 and not port 53 and tcp[13] & 7 == 0"
+            " and tcp[(tcp[12] & 0xf0) >> 2] != 0x16)"
+            " or (ip6[6] == 6 and not port 53 and ip6[53] & 7 == 0 and ip6[40 + ((ip6[52] & 0xf0) >> 2)] != 0x16)"
+            " or (ip[9] == 17 and ip[6:2] & 0x3fff == 0 and udp port 443 and udp[8] & 0x80 == 0)"
+            " or (ip6[6] == 17 and udp port 443 and ip6[48] & 0x80 == 0)))")
 
 DEFAULTS: dict[str, Any] = {
     "INCIDENT_DB": "telemetry_security.db",
@@ -56,6 +69,9 @@ DEFAULTS: dict[str, Any] = {
     # restriction; full capture includes ACKs rather than claiming complete totals
     # after dropping them. balanced is available when measured load requires it.
     "BPF_FILTER": None,
+    # 0 = off. Else frames over this many bytes carrying bulk TCP/QUIC payload are dropped in the kernel
+    # (bulk_shed_filter) and those flows' volume comes from Zeek conn records instead; needs ZEEK_LOGS_ENABLED.
+    "BULK_SHED_BYTES": 0,
     "SENSOR_ID": "",  # default: hostname; use a stable enrolled ID centrally
     # Packets are shipped to the analytics core in batches. One IPC message per
     # packet made pickle/pipe overhead — not detection — the throughput ceiling.
@@ -63,9 +79,9 @@ DEFAULTS: dict[str, Any] = {
     "INGEST_BATCH_SEC": 0.1,     # ...or this long after the batch was opened
     "CORE_SHARDS": 4,  # analytics shard processes plus one merge; 1 = the single core
     "PCAP_STATS_INTERVAL_SEC": 10,  # how often to report kernel-level capture drops
-    "PCAP_BUFFER_BYTES": 268_435_456,  # 256 MiB Npcap buffer absorbs multi-second bursts
+    "PCAP_BUFFER_BYTES": 268_435_456,  # 256 MiB libpcap ring absorbs multi-second bursts
     "PCAP_DRAIN_BATCH": 2048,          # raw frames drained per readiness wake
-    "PCAP_IDLE_BACKOFF_SEC": 0.001,    # prevent stale Npcap readiness from busy-spinning
+    "PCAP_IDLE_BACKOFF_SEC": 0.001,    # prevent spurious readiness from busy-spinning
     "PCAP_ALERT_MIN_LOSS_PCT": 0.1,   # UI degrades above this interval loss rate
     "PCAP_UI_ALERT_INTERVAL_SEC": 60, # repeat persistent loss at most once/minute
     "PCAP_RECOVERY_SAMPLES": 2,       # clean intervals required before recovery
@@ -90,9 +106,9 @@ DEFAULTS: dict[str, Any] = {
     # native records are refused and only gap/health records are written.
     "DISK_MIN_FREE_BYTES": DISK_MIN_FREE_BYTES,
     "METADATA_RETENTION_DAYS": 30,   # prune tombstones/prune audit/orphan order rows; 0 disables
-    "CASE_RETENTION_DAYS": 365,      # delete unpinned closed cases after this; 0 disables
+    "CASE_RETENTION_DAYS": 30,       # delete unpinned closed cases after this; 0 disables
     "ASSET_RETENTION_DAYS": 90,      # delete idle assets unless a case, action or open finding pins them; 0 disables
-    # SURICATA native payload targets; 0 disables a bound.
+    # SURICATA/ZEEK native payload targets, each applied to each source; 0 disables a bound.
     "NATIVE_RETENTION_DAYS": 7,
     "NATIVE_MAX_ROWS": 1_000_000,
     "NATIVE_MAX_BYTES": 1_073_741_824,
@@ -134,6 +150,7 @@ DEFAULTS: dict[str, Any] = {
     "OS_THRESHOLD_WIN": 128,
     "SIG_FILE": "threat_signatures.json",
     "GEO_DB": "GeoLite2-Country.mmdb",
+    "GEO_CITY_DB": "GeoLite2-City.mmdb",  # read by the API for the traffic map only; missing = empty map
 
     # --- device inventory (roadmap #1; passive) ---------------------------
     "DEVICE_INVENTORY_ENABLED": True,
@@ -154,6 +171,7 @@ DEFAULTS: dict[str, Any] = {
     "BASELINE_WARMUP": 10,
     "BASELINE_Z": 4.0,
     "BASELINE_ABS_FLOOR": 50_000,
+    "BASELINE_DEVICE_FLOORS": {},  # {device MAC: bytes}; replaces BASELINE_ABS_FLOOR for that device
     "BASELINE_REL_FLOOR": 0.15,
     "BASELINE_LEDGER": "telemetry_baseline.json",
 
@@ -166,6 +184,7 @@ DEFAULTS: dict[str, Any] = {
     "OWN_MAC": "",
     "GATEWAY_MAC": "",
     "ARP_MAC_FANOUT_THRESHOLD": 4,
+    "ARP_FANOUT_EXEMPT_MACS": [],  # MACs multi-homed by design; exempt from fan-out only, never from rebind
     "ARP_REBIND_CONFIRMATIONS": 3,
     "ARP_REBIND_MIN_SEC": 2.0,
     "ARP_REBIND_WINDOW_SEC": 10.0,
@@ -231,6 +250,8 @@ DEFAULTS: dict[str, Any] = {
     "BEACON_IGNORE_DOMAINS": [],
     "BEACON_IGNORE_DESTINATIONS": [],
     "BEACON_IGNORE_DEVICE_ENDPOINTS": [],
+    # [{mac, domains, _device}]: per-device domain suffixes; keep C2-capable services here, not in BEACON_IGNORE_DOMAINS.
+    "BEACON_IGNORE_DEVICE_DOMAINS": [],
     "ACCEPTED_EGRESS": [],
 
     # --- ordered IPS policy control plane -------------------------------
@@ -270,6 +291,22 @@ DEFAULTS: dict[str, Any] = {
     "SURICATA_HEARTBEAT_SEC": 5,
     "SURICATA_SOURCE_TIMEOUT_SEC": 60,
 
+    # --- optional Zeek JSON log integration (LogAscii::use_json=T) -------
+    "ZEEK_LOGS_ENABLED": False,
+    "ZEEK_LOG_PATHS": ["zeek/*.log"],  # each entry is a path or glob; relative to the base dir
+    "ZEEK_START_AT_END": False,
+    "ZEEK_HEARTBEAT_SEC": 5,
+    "ZEEK_SOURCE_TIMEOUT_SEC": 300,
+
+    # --- optional Wazuh manager alerts.json integration -------------------
+    "WAZUH_ALERTS_ENABLED": False,
+    "WAZUH_ALERTS_PATH": "wazuh/alerts.json",  # service deploys set /var/ossec/logs/alerts/alerts.json
+    "WAZUH_START_AT_END": False,
+    "WAZUH_HEARTBEAT_SEC": 5,
+    "WAZUH_AGENT_ADDRESSES": {},  # agent name -> LAN IP, used when the agent reports loopback/unspecified/"any"
+    "WAZUH_MIN_ALERT_LEVEL": 7,  # rule level (0-15) from which an alert becomes a detection
+    "WAZUH_SOURCE_TIMEOUT_SEC": 900,  # newest alert age before STALE; a quiet manager is not an error
+
     # --- exposure management (phase 4) -----------------------------------
     # CIDRs NetWatch owns. netwatch_scan refuses to ingest nmap results for hosts outside them.
     "EXPOSURE_OWNED_SCOPES": ["10.0.0.0/24"],
@@ -280,7 +317,6 @@ DEFAULTS: dict[str, Any] = {
     "RESPONSE_MODE": "ids_only",
     "RESPONSE_MODE_LEDGER": "telemetry_response_mode.json",
     "MITIGATION_ENABLED": True,
-    "MITIGATION_DRY_RUN": False,
     "MITIGATION_TTL_SEC": 3600,
     # Addresses no response may ever target (e.g. the ISP's DNS resolvers).
     "ALLOWLIST_IPS": [],
@@ -318,6 +354,9 @@ DEFAULTS: dict[str, Any] = {
     # Shape: {"Name": {"ips": ["10.0.0.2"], "macs": ["aa:bb:cc:dd:ee:ff"]}}
     # Source-only and either-endpoint exclusion are separate operator modes.
     "SECURE_NODES": {},
+    # Display names for other LAN devices, {"aa:bb:cc:dd:ee:ff": "Xbox (living room)"}: asset views
+    # only, no exclusion. SECURE_NODES wins for a MAC listed in both.
+    "DEVICE_NAMES": {},
     "HISTORY_OVERVIEW_REFRESH_SEC": 60,
     "HISTORY_DETAIL_REFRESH_SEC": 30,
 
@@ -334,22 +373,7 @@ def detect_default_gateway():
     """Best-effort IPv4 default gateway, used to escalate ARP rebinds of the
     gateway (the classic MITM). Returns "" if undetermined — ARP detection still
     works, just without gateway-specific escalation."""
-    if os.name != "nt":
-        return _proc_route_gateway()
-    try:
-        out = subprocess.run(
-            ["route", "print", "-4", "0.0.0.0"],
-            capture_output=True, text=True, timeout=5, check=True,  # a failed run's output is not a route table
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
-            gw = parts[2]
-            if gw.count(".") == 3 and gw != "0.0.0.0":
-                return gw
-    return ""
+    return _proc_route_gateway()
 
 
 PROC_NET_ROUTE = "/proc/net/route"
@@ -452,7 +476,7 @@ def load_overlay(path):
     """Read one JSON overlay. A malformed or unreadable overlay is skipped with a
     reason rather than taking startup down. Returns ``(dict, error_or_None)``."""
     try:
-        with open(path, encoding="utf-8-sig") as handle:  # Windows tools often write a BOM
+        with open(path, encoding="utf-8-sig") as handle:  # tolerate a BOM some editors write
             data = json.load(handle)
     except (OSError, ValueError) as exc:
         return {}, f"{path}: {type(exc).__name__}: {exc}"
@@ -492,6 +516,14 @@ def build_config(base_dir, *, hostname=None, extra=None, resource_dir=None):
     if configured_filter is not None and not isinstance(configured_filter, str):
         raise ValueError("BPF_FILTER must be a string or null")
     config["BPF_FILTER"] = CAPTURE_PROFILES[profile] if configured_filter is None else configured_filter or None
+    shed = config.get("BULK_SHED_BYTES")
+    if isinstance(shed, bool) or not isinstance(shed, int) or (shed and shed < 256):
+        raise ValueError(f"BULK_SHED_BYTES must be 0 or an integer of at least 256, got {shed!r}")
+    if shed and not config.get("ZEEK_LOGS_ENABLED"):
+        notes.append("WARNING: BULK_SHED_BYTES needs ZEEK_LOGS_ENABLED (bulk volume comes from Zeek); not shedding")
+        config["BULK_SHED_BYTES"] = shed = 0
+    if shed:
+        config["BPF_FILTER"] = " and ".join(f"({f})" for f in (config["BPF_FILTER"], bulk_shed_filter(shed)) if f)
     config["SENSOR_ID"] = str(config.get("SENSOR_ID") or hostname)
     notes.append(f"capture profile: {profile}; kernel filter: {config['BPF_FILTER'] or '<all Ethernet frames>'}")
 
@@ -521,6 +553,20 @@ def build_config(base_dir, *, hostname=None, extra=None, resource_dir=None):
             else:
                 config[key] = base_path
 
+    zeek_paths = config.get("ZEEK_LOG_PATHS")
+    if isinstance(zeek_paths, str):
+        zeek_paths = [zeek_paths]
+    if not isinstance(zeek_paths, list | tuple) or not all(isinstance(p, str) and p for p in zeek_paths):
+        raise ValueError("ZEEK_LOG_PATHS must be a list of nonempty path/glob strings")
+    config["ZEEK_LOG_PATHS"] = [p if os.path.isabs(p) else os.path.normpath(os.path.join(base_dir, p)) for p in zeek_paths]
+    agents = config.get("WAZUH_AGENT_ADDRESSES")
+    try:
+        if not isinstance(agents, dict):
+            raise ValueError("must be an object of agent name to IP")
+        config["WAZUH_AGENT_ADDRESSES"] = {str(name): str(ipaddress.ip_address(addr)) for name, addr in agents.items()}
+    except ValueError as exc:
+        raise ValueError(f"WAZUH_AGENT_ADDRESSES: {exc}") from exc
+
     # All consumers receive canonical CIDRs; legacy overlays remain supported.
     for key, version in (("LOCAL_PREFIXES", 4), ("LOCAL_PREFIXES6", 6)):
         try:
@@ -545,11 +591,12 @@ def build_config(base_dir, *, hostname=None, extra=None, resource_dir=None):
     bad = []
     for value in config.get("BEACON_IGNORE_DESTINATIONS") or ():
         try:
-            ipaddress.ip_address(value)
+            if not ipaddress.ip_network(value).prefixlen:
+                bad.append(value)
         except ValueError:
             bad.append(value)
     if bad:  # the beacon detector skips them silently
-        notes.append(f"WARNING: BEACON_IGNORE_DESTINATIONS entries ignored (not IP addresses): {bad}")
+        notes.append(f"WARNING: BEACON_IGNORE_DESTINATIONS entries ignored (not an address or a non-/0 network): {bad}")
     for value in config.get("SWEEP_IGNORE_SOURCES") or ():
         try:
             ipaddress.ip_address(value)
@@ -561,6 +608,11 @@ def build_config(base_dir, *, hostname=None, extra=None, resource_dir=None):
         bad = [e for e in config.get(key) or () if device_endpoint_rule(e) is None]
         if bad:
             notes.append(f"WARNING: {key} entries ignored (need mac, non-/0 networks): {bad}")
+    from netwatch_flow import device_domain_rule
+
+    bad = [e for e in config.get("BEACON_IGNORE_DEVICE_DOMAINS") or () if device_domain_rule(e) is None]
+    if bad:
+        notes.append(f"WARNING: BEACON_IGNORE_DEVICE_DOMAINS entries ignored (need mac, domains): {bad}")
     from netwatch_flow import device_window_rule
 
     bad = [e for e in config.get("EXFIL_IGNORE_DEVICE_WINDOWS") or () if device_window_rule(e) is None]

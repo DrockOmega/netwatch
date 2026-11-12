@@ -9,7 +9,10 @@ from netwatch_db import NATIVE_PRUNE_BATCH, db_persistence_worker
 from netwatch_evidence_catalog import EvidenceCatalog
 from netwatch_security_store import DurableIncidentStore, retention_status
 from netwatch_suricata import EveCollector
+from netwatch_zeek import ZeekCollector
 from tests.test_sources import append, record
+from tests.test_zeek import FIXTURES
+from tests.test_zeek import append as zeek_append
 
 DAY = 86400
 
@@ -41,10 +44,20 @@ def ids(store, source="SURICATA"):
 
 def test_age_rows_and_bytes_are_applied_per_source_and_keep_the_newest_of_each_type(tmp_path):
     store, source = eve(tmp_path, (1, flows(4)), (10 * DAY, flows(1, 10)))
+    zeek = ZeekCollector(store, {"ZEEK_LOG_PATHS": [str(tmp_path / "*.log")], "DISK_MIN_FREE_BYTES": 0})
+    zeek_append(tmp_path / "conn.log", FIXTURES["conn"])
+    zeek.poll(now=1)
+    zeek_append(tmp_path / "conn.log", dict(FIXTURES["conn"], uid="C2"))
+    zeek.poll(now=2)
     before = ids(store)
     # Age: the four old flows expire; the newest flow is pinned regardless.
     assert prune(store, retention_days=7, now=10 * DAY)["pruned"] == 4
     assert ids(store) == before[-1:]
+    assert len(store.source_events("ZEEK")) == 2  # a SURICATA pass never touches ZEEK
+    # Rows: ZEEK's own target trims the oldest conn record, not the newest.
+    report = prune(store, "ZEEK", max_rows=1, now=3)
+    assert report["pruned"] == 1 and not report["over_quota"]
+    assert store.source_events("ZEEK")[0]["native"]["uid"] == "C2"
     # Bytes: a target below one record trims to the pinned newest of each type.
     append(tmp_path / "eve.json", *flows(3, 20))
     source.poll(now=10 * DAY + 1)
@@ -79,9 +92,20 @@ def test_open_case_detections_holds_and_evidence_pin_records_and_tombstones_are_
 def test_collectors_restore_health_from_pinned_newest_records_after_pruning(tmp_path):
     stats = [record("stats", timestamp=t, stats={"capture": {"kernel_packets": t}}) for t in (100, 200)]
     store, source = eve(tmp_path, (1, [stats[0], *flows(2)]), (2, [stats[1], *flows(1, 5)]))
+    zeek = ZeekCollector(store, {"ZEEK_LOG_PATHS": [str(tmp_path / "*.log")], "DISK_MIN_FREE_BYTES": 0})
+    zeek_append(tmp_path / "conn.log", FIXTURES["conn"])
+    zeek.poll(now=1)
+    zeek_append(tmp_path / "conn.log", dict(FIXTURES["conn"], uid="C2", ts=1700000099.0))
+    zeek_append(tmp_path / "dns.log", FIXTURES["dns"])
+    zeek.poll(now=2)
     assert prune(store, max_bytes=1, now=10 * DAY)["pruned"] == 3  # older stats + two flows
+    assert prune(store, "ZEEK", max_bytes=1, now=10 * DAY)["pruned"] == 1
     restored = EveCollector(store, {"SURICATA_EVE_PATH": str(tmp_path / "eve.json"), "DISK_MIN_FREE_BYTES": 0})
     assert restored.counters == {"kernel_packets": 200} and restored.last_stats_time == 200
+    restored_zeek = ZeekCollector(store, {"ZEEK_LOG_PATHS": [str(tmp_path / "*.log")], "DISK_MIN_FREE_BYTES": 0})
+    assert restored_zeek.last_conn_time == 1700000099.0
+    restored_zeek.poll(now=3)  # nothing new to read; only the reader state is rebuilt
+    assert restored_zeek.health(1700000100)["status"] == "FRESH"
     store.close()
 
 
@@ -153,7 +177,7 @@ def test_persistence_worker_prunes_native_sources_in_bounded_batches(tmp_path, m
 
     def spy(self, source, **kwargs):
         report = original(self, source, **kwargs)
-        if shutdown.is_set():  # a next pass can start before the worker sees shutdown (slower on Windows)
+        if shutdown.is_set():  # a next pass can start before the worker sees shutdown
             return report
         calls.append((source, kwargs["totals"], report["pruned"]))
         if source == "SURICATA" and report["pruned"] < NATIVE_PRUNE_BATCH:
@@ -277,9 +301,11 @@ def test_over_quota_prune_starts_at_the_sources_oldest_candidate_not_the_first_o
     assert counted(max_rows=15, batch=2)["pruned"] == 2
     assert counted(max_rows=15, batch=2)["pruned"] == 2
     assert steps[1] * 3 < steps[0]  # the second pass skips the SURICATA rows below the floor
-    # The held record below the pruned ones stays a candidate: released, it is pruned next.
+    # A record pinned when the walk passed it is left to age, not re-walked every pass (b543).
     store.native_hold(tail[0], actor="analyst", reason="done", enabled=False)
     counted(max_rows=15, batch=1)
+    assert tail[0] in ids(store, "OTHER")
+    prune(store, "OTHER", retention_days=1, now=10**9)
     assert tail[0] not in ids(store, "OTHER")
     store.close()
 

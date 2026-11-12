@@ -41,35 +41,6 @@ def _check_native(value):
             stack.extend((child, depth + 1) for child in item)
 
 
-def _open_log(path):
-    if os.name != "nt":
-        return open(path, "rb")
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel.CloseHandle.restype = wintypes.BOOL
-    # Read-only, with read/write/delete sharing so the producer can rotate logs.
-    handle = kernel.CreateFileW(str(path), 0x80000000, 7, None, 3, 0x80, None)
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-    except Exception:
-        kernel.CloseHandle(handle)
-        raise
-    try:
-        return os.fdopen(descriptor, "rb")
-    except Exception:
-        os.close(descriptor)
-        raise
-
-
 ROTATED_TAIL_GRACE_SEC = 300
 OVERSIZE_SCAN_READS = 64  # ~64 MiB of one unterminated record per poll; past it the run is filed as a loss and the cursor moves on
 
@@ -95,6 +66,7 @@ class JSONLinesReader:
         self.errors = []
         self.partial_lines = 0
         self.visible_files = 0
+        self.newest_path = None
         self.gaps = None  # Unread vanished files found on first discovery; None until then.
 
     @staticmethod
@@ -124,9 +96,10 @@ class JSONLinesReader:
         first_run = self.start_at_end and not self.store.channel_has_cursor(self.channel)
         paths = self._paths()
         self.visible_files = len(paths)
+        self.newest_path = paths[-1] if paths else None  # _paths sorts by mtime
         for path in paths:
             try:
-                handle = _open_log(path)
+                handle = open(path, "rb")
                 stat = os.fstat(handle.fileno())
                 identity = [stat.st_dev, stat.st_ino]
                 if not stat.st_ino:
@@ -138,6 +111,15 @@ class JSONLinesReader:
                     handle.close()
                     continue
                 cursor = self.store.cursor(key)
+                if (cursor is not None and (stat.st_size < cursor["offset"]
+                        or cursor["anchor"] != self._anchor(handle, cursor["offset"]))):
+                    # The filesystem reused a deleted file's inode: that file's cursor is not this one's.
+                    # shortcut: a file truncated in place while no handle held it reads as new, without a gap;
+                    # Zeek and Suricata rotate by rename, never truncate. A held file still files the gap in _poll.
+                    cursor = {"offset": 0, "generation": uuid.uuid4().hex, "anchor": self._anchor(handle, 0),
+                              "channel": self.channel, "file_size": stat.st_size, "path": path,
+                              "initial_skip_bytes": 0}
+                    self.store.checkpoint(key, cursor)
                 if (cursor is not None and path != self.pattern
                         and cursor["offset"] == stat.st_size
                         and cursor["anchor"] == self._anchor(handle, cursor["offset"])):
@@ -275,9 +257,10 @@ class JSONLinesReader:
                         digest.update(line)
                     capped = bool(line) and not line.endswith(b"\n")
                 # A quiet, non-live file will never be completed: keep its tail as an error record.
+                # Under a glob (Zeek's conn*.log) the live file is the newest match; older ones are rotated.
                 final_tail = (not line.endswith(b"\n") and not oversized
-                              and (not state["seen"] or (not any(c in self.pattern for c in "*?[")
-                                                         and state["path"] != self.pattern))
+                              and (not state["seen"] or (state["path"] != self.pattern and (
+                                  not any(c in self.pattern for c in "*?[") or state["path"] != self.newest_path)))
                               and time.time() - stat.st_mtime > ROTATED_TAIL_GRACE_SEC)
                 if not line.endswith(b"\n") and not final_tail and not capped:
                     self.partial_lines += 1

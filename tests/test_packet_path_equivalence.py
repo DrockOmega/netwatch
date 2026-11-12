@@ -64,7 +64,7 @@ def frames():
         tail.append((t + 4 + n * 0.1, _eth(ipv4(udp(_nxdomain(f"h{n}.missing.example"), 53, 40005), 17,
                                                 "192.168.1.1", "192.168.1.71"), src=GW_MAC, dst=LAN_MAC)))
     for n in range(8):  # periodic beacon: a fresh connection every 10 s
-        tail.append((t + 6 + n * 10, _eth(ipv4(tcp(sport=42000 + n, dport=8443, flags=0x02), 6, "192.168.1.72",
+        tail.append((t + 6 + n * 10, _eth(ipv4(tcp(b"poll", sport=42000 + n, dport=8443, flags=0x18), 6, "192.168.1.72",
                                                "93.184.216.35"))))
     return records + tail
 

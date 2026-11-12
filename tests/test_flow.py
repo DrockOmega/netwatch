@@ -300,10 +300,10 @@ def test_human_web_known_automated_source_is_always_noise():
 def test_human_web_automation_configuration_is_safe_and_canonical():
     classifier = HumanWebClassifier(
         background_domains=None,
-        automation_sources=("2001:0db8:0082:ba80:0000:0000:0000:0001",),
+        automation_sources=("2601:0db8:0082:ba80:0000:0000:0000:0001",),
     )
     packet = event(
-        10, src="2001:db8:82:ba80::1", dst="2606:4700:4700::1111",
+        10, src="2601:db8:82:ba80::1", dst="2606:4700:4700::1111",
         mac="",
     )
     flow, _ = FlowTracker().observe(packet, src_local=True, dst_local=False)
@@ -386,3 +386,31 @@ def test_ignored_udp_port_matches_the_local_source_port():
     for timestamp in (0, 10, 20, 30):
         flow, _ = tracker.observe(event(timestamp, protocol="UDP", dport=46713, sport=41641), src_local=True, dst_local=False)
         assert detector.observe(flow, timestamp) is None
+
+
+def test_beacon_detector_skips_first_party_networks_but_not_a_whole_family():
+    detector = BeaconDetector(min_samples=3, ignored_destinations=("2620:149::/32", "0.0.0.0/0", "::/0"))
+    assert len(detector.ignored_networks) == 1
+    flow = {"src_local": True, "dst_local": False, "protocol": "TCP", "destination_port": 5223,
+            "source_mac": "02:00:00:00:00:02", "src_ip": bytes(16), "flow_id": "apns",
+            "dst_ip": ipaddress.ip_address("2620:149:a1e::1").packed}
+    assert all(detector.observe({**flow, "first_seen": t}, t) is None for t in (0, 60, 120, 180))
+    other = {**flow, "dst_ip": ipaddress.ip_address("2606:4700::1").packed}
+    hits = [detector.observe({**other, "first_seen": t}, t) for t in (0, 60, 120, 180)]
+    assert next(hit for hit in hits if hit)["src_mac"] == "02:00:00:00:00:02"
+
+
+def test_beacon_unnamed_samples_to_an_ignored_host_never_build_a_series():
+    # b1068: encrypted DNS and connections without a TLS hello leave most samples unnamed.
+    detector = BeaconDetector(min_samples=3, ignored_domains=("pubmatic.com",))
+    flow = {
+        "src_local": True, "dst_local": False, "src_ip": bytes([10, 0, 0, 18]),
+        "dst_ip": bytes([185, 64, 189, 10]), "destination_port": 443, "protocol": "TCP",
+        "source_mac": "02:00:00:00:00:03", "first_seen": 0, "domain": "", "flow_id": "ad",
+    }
+    for timestamp, domain in ((0, "ads.pubmatic.com"), (10, ""), (20, ""), (30, ""), (40, "")):
+        flow["first_seen"], flow["domain"] = timestamp, domain
+        assert detector.observe(flow, timestamp) is None
+    other = {**flow, "dst_ip": bytes([185, 64, 189, 11]), "domain": ""}
+    findings = [detector.observe({**other, "first_seen": t}, t) for t in (0, 10, 20, 30)]
+    assert any(f and f["kind"] == "BEACONING" for f in findings)  # another host still alerts

@@ -6,11 +6,10 @@ states what privileges it needs, why, and the boundaries it enforces.
 
 ## Privilege requirements
 
-- **Raw packet capture.** The sniffer uses Scapy/Npcap, which requires
-  administrator rights (the packaged build sets `uac_admin=True`). Capture is
-  confined to a single child process (`io_sniffer_process`) — the smallest
-  surface that needs the privilege. The UI and database processes run with the
-  same token today; isolating their privileges further is tracked work.
+- **Raw packet capture.** The sniffer uses Scapy over libpcap, which needs
+  CAP_NET_RAW. On the sensor, `netwatch.service` runs as the unprivileged
+  `netwatch` user and only the capture worker keeps CAP_NET_RAW/CAP_NET_ADMIN;
+  every other worker drops all capabilities and sets no_new_privs.
 - **The monitor makes no outbound calls.** Outbound traffic comes only from
   separate operator-run or scheduled tools: `threatintel_update.py` (threat-intel
   feeds), `tools/refresh_oui_db.py` (IEEE OUI registry) and `netwatch_archive.py`
@@ -18,9 +17,10 @@ states what privileges it needs, why, and the boundaries it enforces.
 
 ## Active mitigation
 
-The mitigation engine (`netwatch_mitigation.py`) can create Windows Firewall
-block rules via `netsh advfirewall`, which requires the elevated token the app
-already holds. It is designed to fail safe:
+The mitigation engine (`netwatch_mitigation.py`) changes no host firewall: its
+`RecordingFirewall` effector records each block and unblock, so policy, ledger and
+expiry run end to end with nothing enforced (the UI says DRY RUN). LAN quarantine
+(`netwatch_quarantine.py`) is the only live containment. It is designed to fail safe:
 
 - **Detection only by default** for fresh installations; response engines remain
   initialized to track existing state. An explicit `IDS + IPS READY` selection
@@ -65,9 +65,7 @@ non-evicting control queue; presentation telemetry remains independently lossy.
 Packet MAC addresses may narrow alert/block rules but cannot authorize `allow`.
 
 This is host-level response rather than an inline packet verdict: the triggering
-packet may already have reached the Windows stack. The planned WinDivert and WFP
-stages therefore remain separate trust boundaries with explicit watchdog and
-bypass requirements.
+packet may already have reached the host.
 
 ## Packet evidence
 
@@ -130,11 +128,9 @@ self-healing loss of connectivity for one LAN device.
 - **Service API.** `netwatch_api.py` listens on loopback (`127.0.0.1:8765`) and
   refuses a non-loopback bind unless explicitly allowed (no TLS then). Every
   request except `GET /v1/hello` needs the bearer token from `service-api.secret`
-  (random 32 bytes, constant-time compare). On Windows the secret's ACL is
-  restricted with `icacls` and the file is refused if any principal other than
-  SYSTEM and Administrators can read it; on POSIX it must be mode 0600. Each
+  (random 32 bytes, constant-time compare). The secret must be an owner-owned regular file with mode 0600. Each
   request has a 5 s whole-request deadline.
-- **Console gateway.** `netwatch_gateway.py` reaches each sensor over an SSH tunnel
+- **console gateway.** `netwatch_gateway.py` reaches each sensor over an SSH tunnel
   to the sensor's loopback API, holding a 0600 copy of that sensor's secret. The
   console talks only to the gateway on `127.0.0.1:8766`, authenticated by the
   bearer token in `ui.token`, and never sees a sensor secret. The service-side
@@ -149,8 +145,8 @@ self-healing loss of connectivity for one LAN device.
   ledger (`telemetry_ledger.db`) and security store. Both are git-ignored. It
   leaves the host only through the optional Google Drive archive
   (`netwatch_archive.py`, via rclone): complete days of ledger history and
-  finished Suricata EVE files, from a scheduled task whose rclone config is
-  readable by SYSTEM and Administrators only. Local data is never deleted by it.
+  finished Suricata EVE files, from the `netwatch-archive.timer` (04:30) whose
+  rclone config (`/var/lib/netwatch/archive/rclone.conf`) is 0600 `netwatch`. Local data is never deleted by it.
   Case data also crosses the SSH tunnel to the console gateway cache. Backups
   (`netwatch_backup.py`) stay local and exclude `service-api.secret`.
 - Outbound fetches (threat-intel feeds, OUI registry) send only a plain HTTPS

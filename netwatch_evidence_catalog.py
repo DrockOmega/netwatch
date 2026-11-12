@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
 import time
 import uuid
 import zipfile
@@ -111,6 +112,17 @@ class EvidenceCatalog:
                 if existing["body"] != manifest:
                     raise ValueError("evidence identity reused with different metadata")
                 return existing
+            moved = self.store.conn.execute("SELECT directory, body FROM evidence_items WHERE evidence_id=?",
+                                            (evidence_id,)).fetchone()
+            if moved:
+                # Restored onto a new sensor path (host migration): same capture, new home.
+                if json.loads(moved["body"]) != manifest:
+                    raise ValueError("evidence identity reused with different metadata")
+                # The capture just passed its integrity check here, so a row pruned on the old host is live again.
+                self.store.conn.execute("UPDATE evidence_items SET directory=?, held=?, status='available' WHERE evidence_id=?",
+                                        (str(self.directory), int(marker.exists()), evidence_id))
+                self._audit(evidence_id, "relocated", {"from": moved["directory"], "to": str(self.directory)})
+                return self.get(evidence_id)
             self.store.conn.execute("INSERT INTO evidence_items VALUES (?,?,?,?,?,?,?,?)",
                                     (evidence_id, str(self.directory), path.name, manifest["created_at"],
                                      manifest["file_bytes"], "available", int(marker.exists()), metadata))
@@ -153,7 +165,8 @@ class EvidenceCatalog:
                 if self.get(manifest["evidence_id"]) is None:
                     self.register(manifest, recovered=True)
                     recovered += 1
-            except (OSError, ValueError, TypeError, KeyError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.IntegrityError) as exc:
+                # One unreconcilable manifest is reported, never allowed to disable the recorder.
                 errors.append({"path": str(sidecar), "error": str(exc)})
         return {"recovered": recovered, "errors": errors}
 

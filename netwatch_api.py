@@ -11,8 +11,6 @@ import re
 import secrets
 import socket
 import stat
-import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -21,14 +19,19 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from netwatch_actions import CONSOLE_ACTOR, STATES, service_actions
-from netwatch_assets import AssetResolver, asset_detail, exposure, list_assets
+from netwatch_assets import AssetResolver, asset_detail, exposure, list_assets, named_nodes
+from netwatch_core import compile_networks, compile_v4_prefixes, compile_v6_prefixes, is_local_ip
 from netwatch_evidence_catalog import EvidenceCatalog
 from netwatch_history import HistoryStore
 from netwatch_security_store import _encode, security_db_path
+from netwatch_threatintel import IndicatorSet
 from netwatch_ui_state import RESPONSE_MODES, load_response_mode, save_response_mode
 
 COMMUNITY_ID = re.compile(r"1:[A-Za-z0-9+/]{27}=")
 FLOW_LIMIT = 500
+GEO_MAX_POINTS = 2000
+GEO_NOISE_BYTES = 10_240  # smaller remotes are background chatter on the map unless flagged
+_IP_TEXT = re.compile(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}")
 MAX_CONNECTIONS = 32
 REQUEST_DEADLINE_SEC = 5.0  # whole request line, headers and body; recv timeout alone lets a trickler hold a slot
 
@@ -37,36 +40,13 @@ def secret_path(config):
     return Path(security_db_path(config)).parent / "service-api.secret"
 
 
-WINDOWS_ALLOWED = {"S-1-5-18", "SY", "S-1-5-32-544", "BA"}  # SYSTEM, BUILTIN\\Administrators (SDDL alias or SID)
-
-
-def windows_acl_principals(path):
-    """(ACE type, principal) pairs from the file's DACL, read as SDDL so names are never localized."""
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "acl.txt"
-        subprocess.run(["icacls", str(path), "/save", str(out)], check=True, capture_output=True)
-        sddl = out.read_bytes().decode("utf-16-le").lstrip("\ufeff")  # icacls /save writes UTF-16LE, no BOM
-    dacl = sddl[sddl.index("D:"):]
-    return [(f[0], f[5]) for f in (ace.split(";") for ace in re.findall(r"\(([^()]*)\)", dacl)) if len(f) > 5]
-
-
-def check_windows_acl(path):
-    """Refuse a token file any principal other than SYSTEM and Administrators can touch (inherited ACEs are fine)."""
-    aces = windows_acl_principals(path)
-    stray = [f"{kind}:{who}" for kind, who in aces if kind != "A" or who not in WINDOWS_ALLOWED]
-    if not aces or stray:
-        # Names the offending ACEs (SIDs, never the secret) so an operator can see what to remove.
-        raise ValueError("API secret ACL must grant only SYSTEM and Administrators; run the console elevated"
-                         f" (found {', '.join(stray) or 'no ACEs'})")
-
-
 def hello_proof(secret, nonce):
     """Domain-separated so the unauthenticated hello is no oracle for the bearer token."""
     return hmac.new(secret, b"netwatch-server:" + nonce.encode(), "sha256").hexdigest()
 
 
 def load_secret(path, *, create=False):
-    """Never replace an existing credential; refuse links and unsafe POSIX modes or Windows ACLs."""
+    """Never replace an existing credential; refuse links and unsafe modes."""
     path = Path(path)
     if create:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -76,20 +56,6 @@ def load_secret(path, *, create=False):
             pass
         else:
             with os.fdopen(fd, "wb") as handle:
-                if os.name == "nt":
-                    # The mode above sets no DACL, so the empty file inherits its folder's (often
-                    # Users-readable) ACL; restrict it before the secret exists.
-                    try:
-                        subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r",
-                                        "*S-1-5-18:F", "*S-1-5-32-544:F"], check=True, capture_output=True)
-                        # An explicit OWNER RIGHTS ACE (GitHub's Windows runner adds one) survives
-                        # the grant and would make check_windows_acl refuse the new secret.
-                        subprocess.run(["icacls", str(path), "/remove:g", "*S-1-3-4"],
-                                       check=True, capture_output=True)
-                    except (OSError, subprocess.CalledProcessError):
-                        handle.close()
-                        path.unlink()  # an empty secret would refuse every later start
-                        raise
                 handle.write(secrets.token_bytes(32))
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -98,12 +64,10 @@ def load_secret(path, *, create=False):
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as handle:
         info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or (os.name == "posix" and
-                (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600):
             raise ValueError("API secret must be an owner-only regular file")
         secret = handle.read(33)
-    if os.name == "nt":
-        check_windows_acl(path)
     if len(secret) != 32:
         raise ValueError("API secret must contain 32 bytes")
     return secret
@@ -184,8 +148,8 @@ class ServiceAPI:
                 supplied = self.headers.get("Authorization", "")
                 if not hmac.compare_digest(supplied.encode(), expected.encode()):
                     # No instance identifier or ledger state on rejection, for any method.
-                    # Drain a small unread body first: closing on unread data makes Windows reset the
-                    # connection, and the client loses the 401 to an abort.
+                    # Drain a small unread body first: closing on unread data resets the connection
+                    # (TCP RST), and the client loses the 401 to an abort.
                     length = self.headers.get("Content-Length", "0")
                     if length.isdigit() and int(length) <= 65536:
                         self.rfile.read(int(length))
@@ -282,6 +246,7 @@ class ServiceAPI:
             return {"service": self.store.source_health("RUNTIME:SERVICE"),
                     "actions": "recording-only",
                     "sensor_id": str(self.config.get("SENSOR_ID") or "unknown"),
+                    "case_retention_days": float(self.config.get("CASE_RETENTION_DAYS", 30) or 0),
                     "response_mode": load_response_mode(self.config.get("RESPONSE_MODE_LEDGER"),
                                                         default=self.config.get("RESPONSE_MODE", "ids_only"))}
 
@@ -289,6 +254,8 @@ class ServiceAPI:
             return self.store.snapshot()
         if path == "/v1/traffic":
             return self._traffic(query)
+        if path == "/v1/geo":
+            return self._geo(query)
         if path == "/v1/feed":
             after = query.get("after", ["0:0"])[0]
             if not re.fullmatch(r"\d{1,18}:\d{1,18}", after):
@@ -314,13 +281,13 @@ class ServiceAPI:
             return self.catalog.list()
         limit = query.get("limit", [None])[0]
         if path == "/v1/assets":
-            return list_assets(self.store, limit, self.config.get("SECURE_NODES"))
+            return list_assets(self.store, limit, named_nodes(self.config))
         if path.startswith("/v1/assets/"):
             rest = path[len("/v1/assets/"):]
             if rest.endswith("/records"):
                 rest = rest[:-len("/records")]
                 return self.assets.asset_records(rest) if asset_detail(self.store, rest) else None
-            return asset_detail(self.store, rest, self.config.get("SECURE_NODES"))
+            return asset_detail(self.store, rest, named_nodes(self.config))
         if path == "/v1/exposure":
             return exposure(self.store, limit)
         if path == "/v1/rules":
@@ -351,8 +318,85 @@ class ServiceAPI:
         finally:
             history.close()
 
+    def _geo(self, query):
+        """Remote WAN endpoints of the last ``window`` seconds, placed by the City database, for the traffic map.
+
+        ``dir`` is ``in`` when the remote opened a conversation (sent from a higher port than it reached), else ``out``.
+        ``noise`` marks known-benign endpoints (ignore lists, under GEO_NOISE_BYTES); ``flags`` name why one matters."""
+        window = int(query.get("window", ["3600"])[0])
+        if not 60 <= window <= 7 * 86400:
+            raise ValueError("invalid geo window")
+        try:
+            reader = self._geo_reader()
+        except (OSError, ValueError):
+            return {"window": window, "points": [], "note": "no city database"}
+        until = time.time()
+        history = HistoryStore(self.ledger_path)  # Read-only; one connection per request thread.
+        try:
+            totals = history.endpoint_totals({"since": until - window, "until": until})
+        finally:
+            history.close()
+        nets = (*self.config.get("LOCAL_PREFIXES", ()), *self.config.get("LOCAL_PREFIXES6", ()))
+        v4, v6 = compile_v4_prefixes(nets), compile_v6_prefixes(nets)
+        remotes = {}
+        for side in ("src", "dst"):
+            for row in totals[side]:
+                try:
+                    address = ipaddress.ip_address(row["host"])
+                except (TypeError, ValueError):
+                    continue
+                if not address.is_global or is_local_ip(address.packed, v4, v6):
+                    continue
+                r = remotes.setdefault(str(address), {"ip": str(address), "bytes": 0, "events": 0,
+                                                       "domain": None, "initiated": 0, "packed": address.packed})
+                r["bytes"] += row["bytes"] or 0
+                r["events"] += row["events"] or 0
+                r["domain"] = r["domain"] or row["domain"]
+                r["initiated"] += row.get("initiated") or 0
+        ignored = [str(d).lower().strip(".") for d in (*self.config.get("BEACON_IGNORE_DOMAINS", ()),
+                                                         *self.config.get("WEB_BACKGROUND_DOMAINS", ())) if str(d).strip(".")]
+        ignored_nets = compile_networks(self.config.get("BEACON_IGNORE_DESTINATIONS", ()) or ())
+        try:
+            intel = IndicatorSet.load(self.config.get("THREATINTEL_CACHE"))
+        except ValueError:
+            intel = IndicatorSet()
+        try:
+            with open(self.config["SIG_FILE"], encoding="utf-8") as f:
+                threat_countries = {str(c).strip().upper() for c in json.load(f).get("countries", [])}
+        except (OSError, ValueError, AttributeError):
+            threat_countries = set()
+        case_ips = set()
+        for case in self.store.snapshot():
+            if (case.get("last_seen") or 0) >= until - window:
+                case_ips.update(_IP_TEXT.findall(json.dumps(case.get("detail", ""))))
+        points = []
+        for r in sorted(remotes.values(), key=lambda r: r["bytes"], reverse=True)[:GEO_MAX_POINTS]:
+            geo = reader.get(r["ip"]) or {}
+            location = geo.get("location") or {}
+            if "latitude" not in location:
+                continue
+            country = (geo.get("country") or {}).get("iso_code") or "--"
+            domain = (r["domain"] or "").lower()
+            flags = [name for name, hit in (
+                ("threat-intel", intel.match_ip(r["packed"]) is not None or intel.match_domain(domain) is not None),
+                ("country", country in threat_countries), ("case", r["ip"] in case_ips)) if hit]
+            noise = not flags and (r["bytes"] < GEO_NOISE_BYTES
+                                   or any(domain == d or domain.endswith(f".{d}") for d in ignored)
+                                   or any(ipaddress.ip_address(r["ip"]) in n for n in ignored_nets))
+            points.append({"ip": r["ip"], "lat": location["latitude"], "lon": location["longitude"],
+                           "city": ((geo.get("city") or {}).get("names") or {}).get("en"), "country": country,
+                           "domain": r["domain"], "bytes": r["bytes"], "events": r["events"],
+                           "dir": "in" if r["initiated"] else "out", "noise": noise, "flags": flags})
+        return {"window": window, "points": points}
+
+    def _geo_reader(self):
+        if getattr(self, "_city_reader", None) is None:
+            import maxminddb  # imported here: only the map needs it in the API process
+            self._city_reader = maxminddb.open_database(self.config["GEO_CITY_DB"])
+        return self._city_reader
+
     def _flows(self, community_id):
-        """NetWatch ledger rows plus Suricata native records sharing one Community ID, bounded per source."""
+        """NetWatch ledger rows plus Suricata/Zeek native records sharing one Community ID, bounded per source."""
         if not COMMUNITY_ID.fullmatch(community_id):
             raise ValueError("invalid community id")
         history = HistoryStore(self.ledger_path)  # Read-only; one connection per request thread.
@@ -360,9 +404,10 @@ class ServiceAPI:
             netwatch = history.query({"community_id": community_id}, limit=FLOW_LIMIT)
         finally:
             history.close()
-        return {"community_id": community_id, "limit": FLOW_LIMIT, "netwatch": netwatch,
-                "suricata": self.assets.annotate(
-                    self.store.source_events("SURICATA", community_id=community_id, limit=FLOW_LIMIT))}
+        return {"community_id": community_id, "limit": FLOW_LIMIT, "netwatch": netwatch, **{
+            source.lower(): self.assets.annotate(
+                self.store.source_events(source, community_id=community_id, limit=FLOW_LIMIT))
+            for source in ("SURICATA", "ZEEK", "WAZUH")}}
 
     def _action_command(self, body):
         """Console verbs. The actor is server-assigned and cannot be supplied."""

@@ -31,7 +31,7 @@ def _settle(window, timeout=5.0):
     while window._effects_pending and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.005)
-    app.processEvents()
+    # No trailing processEvents: the 100 ms poll timer would queue a fresh reconcile (b633).
     assert not window._effects_pending
 
 
@@ -839,7 +839,7 @@ def test_unblock_firewall_failure_keeps_entry_and_reports(tmp_path):
             pass
 
         def unblock(self, rule_name):
-            raise FirewallError("netsh timeout")
+            raise FirewallError("effector timeout")
 
     app = _app()
     window = _bare_window(tmp_path)

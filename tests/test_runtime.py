@@ -285,43 +285,6 @@ def test_service_survives_a_locked_store_tick(tmp_path, monkeypatch):
 
 
 
-def test_stop_file_requests_an_ordered_stop(tmp_path, monkeypatch):
-    import netwatch_service
-
-    closed, ticks = [], []
-
-    class Supervisor:
-        def __init__(self, config):
-            pass
-
-        def tick(self):
-            ticks.append(1)
-            if len(ticks) == 2:
-                (tmp_path / netwatch_service.STOP_FILE).touch()
-
-        def close(self):
-            closed.append(1)
-
-    class API:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            return self
-
-        def close(self):
-            pass
-
-    (tmp_path / netwatch_service.STOP_FILE).touch()  # stale from an earlier run: must not stop this start
-    monkeypatch.setattr(netwatch_service, "ServiceSupervisor", Supervisor)
-    monkeypatch.setattr(netwatch_service, "ServiceAPI", API)
-    monkeypatch.setattr(netwatch_service, "load_secret", lambda *a, **k: b"x" * 32)
-    monkeypatch.setattr(netwatch_service.signal, "signal", lambda *a: None)
-    assert netwatch_service.main(["--base-dir", str(tmp_path)]) == 0
-    assert closed == [1] and len(ticks) == 2
-    assert not (tmp_path / netwatch_service.STOP_FILE).exists()
-
-
 def test_startup_failures_reach_the_service_log(tmp_path, monkeypatch):
     import logging
 
@@ -351,7 +314,7 @@ def test_startup_failures_reach_the_service_log(tmp_path, monkeypatch):
 
 def killed_in_drain_worker(*args):
     args[-1].wait()
-    os.kill(os.getpid(), getattr(signal, "SIGKILL", signal.SIGTERM))  # SIGTERM is TerminateProcess on Windows
+    os.kill(os.getpid(), signal.SIGKILL)
 
 
 def held_db_worker(*args):
@@ -553,7 +516,6 @@ def stop_ignoring_lock_holder(*args):
     time.sleep(3600)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="ignoring SIGTERM needs POSIX signals")
 def test_hung_collector_is_killed_without_spending_the_drain_budget(tmp_path, monkeypatch):
     import multiprocessing
 
@@ -838,7 +800,7 @@ def test_stop_during_restart_backoff_files_no_second_gap(tmp_path, monkeypatch):
 
 
 def test_stop_signal_threads_never_poll_the_pipe_concurrently_or_blocking():
-    """Concurrent blocking polls of one pipe stalled Sensor1's capture loop ~32 s (Windows wait())."""
+    """Concurrent blocking polls of one pipe stalled the sensor's capture loop ~32 s (2026-10-12)."""
     import multiprocessing as mp
     import threading
 
@@ -894,5 +856,58 @@ def test_pending_findings_cap_coalesces_into_counted_summary(tmp_path, monkeypat
         assert len(gaps) == 65  # 64 queued + 1 summary
         assert [g["detail"] for g in gaps].count("6 further runtime findings coalesced while the security store refused writes") == 1
         assert not supervisor.pending_findings and supervisor.coalesced_findings == 0
+    finally:
+        supervisor.close()
+
+
+def test_zeek_worker_is_wired_and_stops_first_in_ordered_shutdown(tmp_path, monkeypatch):
+    from netwatch_security_store import DurableIncidentStore
+
+    for name in ("io_sniffer_process", "dod_core_process", "db_persistence_worker", "durable_analysis_process"):
+        monkeypatch.setattr(netwatch_runtime, name, idle_worker)
+    (tmp_path / "zeek").mkdir()
+    (tmp_path / "zeek" / "notice.log").write_text(json.dumps({
+        "ts": time.time(), "note": "Fixture::Notice", "msg": "fixture",
+        "id.orig_h": "203.0.113.9", "id.resp_h": "10.0.0.12"}) + "\n")
+    config = {"INCIDENT_DB": str(tmp_path / "security.db"), "ZEEK_LOGS_ENABLED": True,
+              "ZEEK_LOG_PATHS": [str(tmp_path / "zeek" / "*.log")], "ZEEK_HEARTBEAT_SEC": 1,
+              "LOCAL_PREFIXES": ["10.0.0.0/8"], "SENSOR_ID": "fixture",
+              "LOG_DIR": str(tmp_path / "logs"), "LOG_TO_CONSOLE": False}
+    runtime = netwatch_runtime.MonitoringRuntime(config)
+    try:
+        runtime.start()
+        assert [p.name for p in runtime.workers] == ["db", "sniffer", "core", "analysis", "zeek"]
+        alert = runtime.queues["alert"].get(timeout=15)
+        assert (alert["source"], alert["action"]) == ("ZEEK", "ZEEK_NOTICE")
+        heartbeat = None
+        deadline = time.time() + 15
+        while heartbeat is None and time.time() < deadline:
+            payload = runtime.queues["worker_status"].get(timeout=15)
+            heartbeat = payload if payload["source"] == "ZEEK" else None
+        assert heartbeat is not None
+        assert runtime.stop(grace=15) == []
+        assert runtime.shutdown_report["ordered_drain"]
+    finally:
+        runtime.stop()
+    store = DurableIncidentStore(config["INCIDENT_DB"], sensor_id="fixture")
+    try:
+        assert [case["action"] for case in store.snapshot()] == ["ZEEK_NOTICE"]
+        assert store.source_health("SOURCE:ZEEK:fixture")["source"] == "ZEEK"
+    finally:
+        store.close()
+
+
+def test_service_widens_shard_pipes_and_sends_no_render_rows(tmp_path, monkeypatch):
+    widened = []  # the kernel refuses F_SETPIPE_SZ once the user is over fs.pipe-user-pages-soft, so read the requests
+    monkeypatch.setattr(netwatch_runtime, "widen_pipe", widened.append)
+    for name in ("io_sniffer_process", "dod_core_process", "db_persistence_worker", "durable_analysis_process"):
+        monkeypatch.setattr(netwatch_runtime, name, idle_worker)
+    supervisor = ServiceSupervisor({"INCIDENT_DB": str(tmp_path / "security.db"), "CORE_SHARDS": 2})
+    try:
+        supervisor.tick(now=100.0)
+        queues = supervisor.runtime.queues
+        for name in ("ingestion-core-0", "ingestion-core-1", "merge-core-0", "merge-core-1"):
+            assert queues[name] in widened, name
+        assert supervisor.runtime.config["_RENDER_ROWS"] is False  # no window reads them on the service
     finally:
         supervisor.close()

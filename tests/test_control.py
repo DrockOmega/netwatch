@@ -186,6 +186,28 @@ def test_overflow_failed_commits_retry_and_unclean_session_are_visible(tmp_path,
     store.close()
 
 
+def test_stop_starts_no_retention_pass(tmp_path, monkeypatch):
+    # A quota scan begun mid-drain spent the stop deadline, so every restart recorded a control gap (b319).
+    store = DurableIncidentStore(tmp_path / "security.db")
+    collector = ControlCollector(store, {"CONTROL_PRUNE_INTERVAL_SEC": 1})
+    process = collector.process
+    started = time.monotonic()
+    worker = ControlCaptureWorker(collector, heartbeat_sec=0.1)
+    time.sleep(0.3)  # the first pass runs at start
+    passes = []
+    monkeypatch.setattr(DurableIncidentStore, "prune_control_records", lambda self, **kw: passes.append(kw) or time.sleep(5))
+    monkeypatch.setattr(collector, "process", lambda *a, **kw: time.sleep(0.004) or process(*a, **kw))
+    frame = ra_frame()
+    data = parse_ethernet_frame(frame, 100)[1]
+    time.sleep(started + 0.75 - time.monotonic())
+    assert all(worker.submit(frame, data) for _ in range(200))  # four batches: the drain outlasts the interval
+    assert worker.close(timeout=2)
+    assert passes == []
+    assert worker.accepted == 200
+    assert store.source_health(collector.source_key)["state"] == "stopped"
+    store.close()
+
+
 def test_invalid_policy_is_rejected_and_invalid_input_records_a_gap(tmp_path):
     store = DurableIncidentStore(tmp_path / "security.db")
     for policy in ({"CONTROL_TRUSTED_RA_MACS": ["invalid"]}, {"CONTROL_TRUSTED_DHCP_SERVERS": ["300.1.1.1"]},
@@ -315,17 +337,38 @@ def test_control_retention_drains_a_backlog_without_waiting_the_interval(tmp_pat
     store.close()
 
 
+def test_a_configured_batch_over_the_store_clamp_still_drains_the_backlog(tmp_path, monkeypatch):
+    """The store clamps a pass to CONTROL_PRUNE_MAX_BATCH; a larger configured batch must still chain passes."""
+    import netwatch_security_store
+    from tests.test_arp_replay import A, record
+
+    monkeypatch.setattr(netwatch_security_store, "CONTROL_PRUNE_MAX_BATCH", 2)
+    store = DurableIncidentStore(tmp_path / "security.db")
+    collector = ControlCollector(store, {"CONTROL_MAX_ROWS": 1, "CONTROL_PRUNE_BATCH_ROWS": 5000,
+                                         "CONTROL_RETENTION_DAYS": 0, "CONTROL_PRUNE_INTERVAL_SEC": 3600,
+                                         "ARP_DETECTION_ENABLED": False})
+    for timestamp in range(1, 8):
+        record(collector, A, timestamp)
+    worker = ControlCaptureWorker(collector, heartbeat_sec=0.1)
+    deadline = time.monotonic() + 5
+    while len(store.source_events("CONTROL")) > 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert worker.close()
+    assert len(store.source_events("CONTROL")) == 1
+    store.close()
+
+
 def test_a_failing_retention_pass_does_not_block_frame_commits(tmp_path, monkeypatch):
     import sqlite3
 
     store = DurableIncidentStore(tmp_path / "security.db")
     calls = []
 
-    def broken(**kwargs):
+    def broken(self, **kwargs):
         calls.append(kwargs)
         raise sqlite3.DatabaseError("database disk image is malformed")
 
-    monkeypatch.setattr(store, "prune_control_records", broken)
+    monkeypatch.setattr(DurableIncidentStore, "prune_control_records", broken)
     worker = ControlCaptureWorker(ControlCollector(store, {}), heartbeat_sec=60)
     frame = ra_frame(hop_limit=64)
     data = parse_ethernet_frame(frame, 100)[1]

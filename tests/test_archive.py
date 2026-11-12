@@ -87,7 +87,6 @@ def test_rclone_command_lines_and_remote_retention(tmp_path, monkeypatch):
     import netwatch_archive
 
     calls = []
-    # Also answers build_config's gateway lookup (route print) on Windows.
     monkeypatch.setattr(netwatch_archive.subprocess, "run",
                         lambda cmd, **kw: calls.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, "", ""))
     netwatch_archive.rclone_uploader("rc", tmp_path / "r.conf")(tmp_path / "a.gz", "remote:dir/a.gz")

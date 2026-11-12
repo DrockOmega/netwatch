@@ -163,3 +163,52 @@ def test_missing_and_corrupt_evidence_age_out(tmp_path):
     assert set(removed) == {missing["evidence_id"], corrupt["evidence_id"]}
     assert {catalog.get(i)["status"] for i in removed} == {"pruned"}
     recorder.close()
+
+
+def test_restore_onto_new_directory_relocates_catalog_rows(tmp_path):
+    # Host migration: the store and the captures move to a new sensor path (Windows -> Linux).
+    db = tmp_path / "security.db"
+    old, new = tmp_path / "old", tmp_path / "new"
+    recorder = EvidenceRecorder(old, pre_sec=0, post_sec=0, catalog_path=str(db))
+    first = capture(recorder)
+    recorder.close()
+    new.mkdir()
+    for f in old.iterdir():
+        if f.name.endswith((".pcap", ".manifest.json", ".hold")):
+            (new / f.name).write_bytes(f.read_bytes())
+    recorder = EvidenceRecorder(new, pre_sec=0, post_sec=0, catalog_path=str(db))
+    item = recorder.catalog.get(first["evidence_id"])
+    assert item and item["directory"] == str(new.resolve())
+    assert recorder.catalog.verify(item["evidence_id"])["ok"]
+    assert "relocated" in [a["operation"] for a in recorder.catalog.audit(item["evidence_id"])]
+    recorder.close()
+
+
+def test_relocated_row_pruned_on_old_host_is_available_again(tmp_path):
+    db = tmp_path / "security.db"
+    old, new = tmp_path / "old", tmp_path / "new"
+    recorder = EvidenceRecorder(old, pre_sec=0, post_sec=0, catalog_path=str(db))
+    first = capture(recorder)
+    with recorder.catalog.store._transaction():
+        recorder.catalog.store.conn.execute("UPDATE evidence_items SET status='pruned'")
+    recorder.close()
+    new.mkdir()
+    for f in old.iterdir():
+        if f.name.endswith((".pcap", ".manifest.json")):
+            (new / f.name).write_bytes(f.read_bytes())
+    recorder = EvidenceRecorder(new, pre_sec=0, post_sec=0, catalog_path=str(db))
+    assert recorder.catalog.get(first["evidence_id"])["status"] == "available"
+    recorder.close()
+
+
+def test_unreconcilable_manifest_is_reported_not_fatal(tmp_path):
+    db = tmp_path / "security.db"
+    recorder = EvidenceRecorder(tmp_path / "ev", pre_sec=0, post_sec=0, catalog_path=str(db))
+    capture(recorder)
+    # Same file, catalogued under another identity: the sidecar's INSERT collides on (directory, filename).
+    with recorder.catalog.store._transaction():
+        recorder.catalog.store.conn.execute("UPDATE evidence_items SET evidence_id=?", ("0" * 32,))
+    recorder.close()
+    recorder = EvidenceRecorder(tmp_path / "ev", pre_sec=0, post_sec=0, catalog_path=str(db))
+    assert recorder.recovery["recovered"] == 0 and len(recorder.recovery["errors"]) == 1
+    recorder.close()

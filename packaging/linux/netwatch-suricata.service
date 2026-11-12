@@ -1,0 +1,46 @@
+# Suricata (AF_PACKET) for NetWatch. Own unit so the distro suricata.service stays disabled.
+# Capture interface: NW_IFACE in /etc/netwatch/sensor.env. Rules are reloaded live (SIGUSR2) by netwatch-suricata-update.
+[Unit]
+Description=Suricata IDS for NetWatch (AF_PACKET)
+After=network.target
+
+[Service]
+Type=simple
+User=suricata
+Group=suricata
+Environment=TZ=UTC
+Environment=NW_IFACE=eth0
+EnvironmentFile=-/etc/netwatch/sensor.env
+ExecStartPre=/usr/bin/suricata -T -c /etc/netwatch/suricata/suricata.yaml -l /var/lib/suricata
+ExecStart=/usr/bin/suricata -c /etc/netwatch/suricata/suricata.yaml --af-packet=${NW_IFACE} -l /var/lib/suricata
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+LimitNOFILE=65536
+# EVE is group-readable so the netwatch user (SupplementaryGroups=suricata) can tail it.
+UMask=0027
+StateDirectory=suricata suricata/rules suricata/cache/sgh
+StateDirectoryMode=0750
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

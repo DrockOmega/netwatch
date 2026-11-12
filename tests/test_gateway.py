@@ -1,5 +1,4 @@
 import json
-import os
 import sqlite3
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -241,17 +240,16 @@ def test_traffic_passes_the_window_through(sensor):
         gateway.close()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="the gateway and its 0600 node files are Linux-only")
 def test_restart_needs_the_typed_sensor_name_and_runs_once(sensor, monkeypatch, tmp_path):
     import subprocess
 
     import netwatch_gateway
 
     url, secret, _ = sensor
-    (tmp_path / "sensor1.tunnel").write_text('LOCAL_PORT=18765\nRESTART="schtasks /End /TN NetWatchService"\n')
+    (tmp_path / "sensor1.tunnel").write_text('LOCAL_PORT=18765\nRESTART="sudo systemctl restart netwatch"\n')
     (tmp_path / "sensor1.secret").write_bytes(secret)
     (tmp_path / "sensor1.secret").chmod(0o600)
-    assert netwatch_gateway.discover_nodes(tmp_path)[0].restart_command == "schtasks /End /TN NetWatchService"
+    assert netwatch_gateway.discover_nodes(tmp_path)[0].restart_command == "sudo systemctl restart netwatch"
     runs = []
     monkeypatch.setattr(netwatch_gateway.subprocess, "run",
                         lambda argv, **kw: runs.append(argv) or subprocess.CompletedProcess(argv, 0, "SUCCESS", ""))
@@ -343,7 +341,6 @@ def test_a_malformed_node_file_skips_only_that_node(tmp_path):
     assert [node.name for node in discover_nodes(tmp_path)] == ["good"]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="the gateway and its 0600 token are Linux-only")
 def test_an_empty_token_file_is_refused(tmp_path):
     from netwatch_gateway import load_token
 
@@ -356,7 +353,6 @@ def test_an_empty_token_file_is_refused(tmp_path):
     assert len(load_token(path)) == 64
 
 
-@pytest.mark.skipif(os.name == "nt", reason="the gateway and its 0600 token are Linux-only")
 def test_a_loose_token_file_is_refused(tmp_path):
     from netwatch_gateway import load_token
 
@@ -447,3 +443,25 @@ def test_actions_cap_keeps_every_requested_action(monkeypatch):
     rows = cache.actions()
     assert len(rows) == 4
     assert {r["id"] for r in rows} >= {"r0", "r1", "r2"}
+
+
+def test_cache_retention_follows_each_node_and_drops_old_closed_cases_with_their_rows():
+    cache = Cache(":memory:")
+    now, day = 1000 * 86400, 86400
+    for node in ("sensor1", "keepall"):
+        page = _page(node, False, n=0)
+        page["cases"] = [{"incident_id": "gone", "status": "Dismissed", "last_seen": now - 31 * day},
+                         {"incident_id": "open", "status": "Open", "last_seen": now - 31 * day},
+                         {"incident_id": "acted", "status": "Resolved", "last_seen": now - 31 * day},
+                         {"incident_id": "fresh", "status": "Resolved", "last_seen": now - 29 * day}]
+        page["detections"] = [{"event_id": f"e-{c['incident_id']}", "incident_id": c["incident_id"],
+                               "received_at": 0} for c in page["cases"]]
+        page["case_audit"] = [{"sequence": i, "incident_id": c["incident_id"]} for i, c in enumerate(page["cases"])]
+        page["actions"] = [{"id": "x1", "state": "released", "case_id": "acted"}]
+        cache.apply(node, page)
+    retention = {"sensor1": 30.0, "keepall": 0.0, "unknown": None}
+    assert cache.prune(retention, now) == 1 and cache.prune(retention, now) == 0
+    assert cache.case_detail("sensor1", "gone") is None and cache.case_detail("keepall", "gone") is not None
+    assert all(len(cache.case_detail("sensor1", i)["detections"]) == 1 for i in ("open", "acted", "fresh"))
+    left = cache.conn.execute("SELECT node, incident_id FROM detections UNION ALL SELECT node, incident_id FROM case_audit")
+    assert ("sensor1", "gone") not in set(left)

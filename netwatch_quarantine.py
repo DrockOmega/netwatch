@@ -38,8 +38,6 @@ import ipaddress
 import json
 import logging
 import os
-import re
-import subprocess
 import threading
 import time
 
@@ -88,22 +86,23 @@ def is_protected(ip, *, gateway_ip, own_ip, allowlist_ips):
     return str(addr) == "255.255.255.255"
 
 
+PROC_NET_ARP = "/proc/net/arp"
+
+
 def _parse_arp_cache():
-    """Parse the OS ARP cache into ``{ip: normalized_mac}``. Best-effort; an empty
-    dict on any failure. Windows ``arp -a`` uses ``aa-bb-cc-dd-ee-ff`` form."""
-    try:
-        out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=5, check=True).stdout
-    except (OSError, subprocess.SubprocessError):
-        return {}
+    """The kernel ARP cache as ``{ip: normalized_mac}``; an empty dict on any failure."""
     table = {}
-    row = re.compile(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9A-Fa-f]{2}(?:[-:][0-9A-Fa-f]{2}){5})\b")
-    for line in out.splitlines():
-        m = row.match(line)
-        if not m:
-            continue
-        mac = normalize_mac(m.group(2))
-        if mac:
-            table[m.group(1)] = mac
+    try:
+        with open(PROC_NET_ARP, encoding="ascii") as handle:
+            rows = [line.split() for line in handle.readlines()[1:]]
+    except OSError:
+        return {}
+    for row in rows:
+        # IP address, HW type, Flags, HW address, Mask, Device; flags 0x0 is an incomplete entry.
+        if len(row) >= 4 and row[2] != "0x0":
+            mac = normalize_mac(row[3])
+            if mac:
+                table[row[0]] = mac
     return table
 
 

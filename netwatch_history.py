@@ -151,6 +151,23 @@ class HistoryStore:
                f"GROUP BY country ORDER BY events DESC LIMIT ?")
         return self._run(sql, params + [int(limit)])
 
+    def endpoint_totals(self, filters=None, limit=5000):
+        """Per-address byte/event totals as sender (``src``) and receiver (``dst``) for the geo map.
+
+        ``initiated`` counts the address's packets sent from a higher port than they reached: the
+        address opened that conversation (a client port talking to a service port)."""
+        where, params = self._where(filters)
+        events = "SUM(packet_count)" if self.has_packet_count else "COUNT(*)"
+        initiated = (f"SUM(CASE WHEN source_port > port THEN {'packet_count' if self.has_packet_count else 1} "
+                     f"ELSE 0 END)" if "source_port" in self.metadata_columns else "0")
+        domain = "MAX(NULLIF(sni_domain, 'encrypted-payload'))"
+        out = {}
+        for side, extra in (("src", f", {initiated} AS initiated"), ("dst", "")):
+            sql = (f"SELECT {side}_ip AS host, {events} AS events, SUM(size_bytes) AS bytes, {domain} AS domain{extra} "
+                   f"FROM network_events{where} GROUP BY +{side}_ip ORDER BY bytes DESC LIMIT ?")
+            out[side] = self._run(sql, params + [int(limit)])
+        return out
+
     def timeline(self, filters=None, bucket_sec=60):
         """Event + byte counts bucketed into ``bucket_sec`` windows, oldest first."""
         b = max(1, int(bucket_sec))

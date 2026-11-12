@@ -16,12 +16,12 @@ from netwatch_suricata import normalize_eve_event
     ("192.168.2.1", "1.1.1.1"),
     ("169.254.1.2", "8.8.8.8"),
     ("fe80::123", "2606:4700:4700::1111"),
-    ("2001:db8:82:ba80::123", "2001:db8:82:ba81::123"),
+    ("2601:db8:82:ba80::123", "2601:db8:82:ba81::123"),
 ])
 def test_default_locality_agrees_across_sources(tmp_path, local, remote):
     cfg, _ = build_config(tmp_path, extra={
         "LOCAL_PREFIXES6_AUTO": False,
-        "LOCAL_PREFIXES6": ["2001:db8:82:ba80::/64"], "GATEWAY_IP": "10.0.0.1",
+        "LOCAL_PREFIXES6": ["2601:db8:82:ba80::/64"], "GATEWAY_IP": "10.0.0.1",
     })
     v4 = compile_v4_prefixes(cfg["LOCAL_PREFIXES"])
     v6 = compile_v6_prefixes(cfg["LOCAL_PREFIXES6"])
@@ -38,11 +38,11 @@ def test_default_locality_agrees_across_sources(tmp_path, local, remote):
 def test_config_canonicalizes_legacy_prefixes_and_cidr_host_bits(tmp_path):
     cfg, _ = build_config(tmp_path, extra={
         "LOCAL_PREFIXES": ["10.", "192.168.", "10.0.0.7/8", "8.8.8.99/24"],
-        "LOCAL_PREFIXES6": ["2001:db8:82:ba80::123/64"],
+        "LOCAL_PREFIXES6": ["2601:db8:82:ba80::123/64"],
         "LOCAL_PREFIXES6_AUTO": False, "GATEWAY_IP": "10.0.0.1",
     })
     assert cfg["LOCAL_PREFIXES"] == ("10.0.0.0/8", "192.168.0.0/16", "8.8.8.0/24")
-    assert cfg["LOCAL_PREFIXES6"] == ("2001:db8:82:ba80::/64",)
+    assert cfg["LOCAL_PREFIXES6"] == ("2601:db8:82:ba80::/64",)
     mit = Mitigator(allowlist_prefixes=cfg["LOCAL_PREFIXES"])
     assert mit.evaluate("8.8.8.8", "protect configured LAN") == "ALLOWLISTED"
     assert is_local_ip(ip_pack("8.8.8.8"), compile_v4_prefixes(cfg["LOCAL_PREFIXES"]))

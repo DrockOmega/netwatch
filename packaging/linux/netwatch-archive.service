@@ -1,0 +1,39 @@
+[Unit]
+Description=Archive NetWatch history and EVE to the rclone remote
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=netwatch
+Group=netwatch
+Environment=TZ=UTC
+EnvironmentFile=-/etc/netwatch/sensor.env
+UMask=0027
+Nice=10
+Environment=HOME=/var/lib/netwatch
+Environment=NW_RCLONE_CONFIG=/var/lib/netwatch/archive/rclone.conf
+WorkingDirectory=/opt/netwatch
+StateDirectory=netwatch
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/netwatch
+SupplementaryGroups=suricata
+ExecStart=/opt/netwatch/.venv/bin/python netwatch_archive.py --base-dir /var/lib/netwatch --remote gdrive:NetWatch-Archive --rclone-config ${NW_RCLONE_CONFIG} --keep-days 90
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native

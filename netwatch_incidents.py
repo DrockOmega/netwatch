@@ -24,6 +24,14 @@ SEVERITY_RANK = {
 }
 
 _CLOSED_INCIDENT_STATUSES = {"Resolved", "Recovered", "Dismissed"}
+# Recorded for the timeline, never awaiting triage: a known device going quiet, and any info-severity
+# finding. They are filed Resolved and a repeat at info does not reopen them; a real alert does.
+_INFO_ONLY_ACTIONS = {"WIRELESS_DEVICE_QUIET"}
+INFO_CLOSURE_REASON = "Informational finding: recorded for the timeline, no triage needed"
+
+
+def info_only(action, severity):
+    return action in _INFO_ONLY_ACTIONS or severity == "info"
 INCIDENT_SCOPES = ("OPEN INCIDENTS", "CRITICAL ONLY", "ALL INCIDENTS")
 
 
@@ -54,6 +62,8 @@ _ACTION_SEVERITY = {
     "BEACON_ANOMALY": "alert",
     "POLICY_DECISION": "alert",
     "SURICATA_ALERT": "alert",
+    "ZEEK_NOTICE": "alert",
+    "WAZUH_ALERT": "alert",
     "CAPTURE_LOSS": "anomaly",
     "CAPTURE_RECOVERED": "recovered",
     "SIGNATURE_UPDATE_RECOVERED": "recovered",
@@ -77,6 +87,8 @@ _ACTION_TITLES = {
     "BEACON_ANOMALY": "Periodic command-and-control beacon",
     "POLICY_DECISION": "Network policy violation",
     "SURICATA_ALERT": "Suricata inspection finding",
+    "ZEEK_NOTICE": "Zeek notice",
+    "WAZUH_ALERT": "Wazuh endpoint alert",
     "CONTROL_REVIEW": "Control-plane observation needs review",
     "CONTROL_COLLECTION_GAP": "Control-plane collection gap",
     "POLICY_LOAD_FAILED": "Network policy unavailable",
@@ -424,8 +436,9 @@ class IncidentStore:
                 detail=message,
                 target=entity or target,
                 severity=severity,
+                # ACCEPTED_EGRESS is info: filed Resolved like other known-safe records, out of the open list.
                 status="Recovered" if severity == "recovered" else (
-                    "Acknowledged" if action == "ACCEPTED_EGRESS" else "Open"),
+                    "Resolved" if info_only(action, severity) else "Open"),
                 first_seen=now,
                 last_seen=now,
                 count=1,
@@ -440,7 +453,8 @@ class IncidentStore:
             incident.last_seen = max(incident.last_seen, now)
             incident.count += 1
             # Severity stays the highest member detection's own severity; a join never adds to it.
-            if SEVERITY_RANK[severity] > SEVERITY_RANK[incident.severity]:
+            escalated = SEVERITY_RANK[severity] > SEVERITY_RANK[incident.severity]
+            if escalated:
                 incident.severity = severity
             confidence = self._confidence(data)
             if (join or incident.rules) and \
@@ -449,7 +463,10 @@ class IncidentStore:
             incident.confidence = confidence
             if severity == "recovered":
                 incident.status = "Recovered"
-            elif incident.status in _CLOSED_INCIDENT_STATUSES:
+            elif (incident.status in _CLOSED_INCIDENT_STATUSES and not info_only(action, severity)
+                  and (incident.status != "Dismissed" or escalated)):
+                # Dismissed is an analyst's "this is noise": a repeat at the same severity stays closed and
+                # only counts; an escalation reopens it. Resolved/Recovered reopen on any repeat.
                 incident.status = "Open"
         if join:
             _, rule, reason, joined_source = join

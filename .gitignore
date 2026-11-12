@@ -63,3 +63,4 @@ telemetry_response_mode.json
 
 # --- Local review/audit tool output ---
 .audit/
+telemetry_names_*.json

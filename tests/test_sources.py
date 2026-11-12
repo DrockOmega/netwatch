@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import queue
 import sqlite3
 import threading
@@ -116,6 +118,22 @@ def test_truncate_and_regrow_beyond_checkpoint_reports_gap_and_reads_new_generat
     rows = store.source_events("SURICATA")
     assert {row["event_type"] for row in rows} == {"flow", "dns", "collector_gap"}
     assert source.health(101)["status"] == "DEGRADED"
+    source.close()
+    store.close()
+
+
+def test_new_file_on_a_reused_inode_is_read_from_start_without_a_gap(tmp_path):
+    # Zeek cleanup deletes old logs and ext4 hands their inode numbers to new ones (b318).
+    path = tmp_path / "eve.json"
+    append(path, record("flow"))
+    store, source = collector(tmp_path)
+    stat = os.stat(path)
+    key = hashlib.sha256(json.dumps(["SURICATA", "sensor-a", [stat.st_dev, stat.st_ino]]).encode()).hexdigest()
+    store.checkpoint(key, {"offset": 9_000_000, "generation": "old", "anchor": "0" * 64,
+                           "channel": source.reader.channel, "file_size": 9_000_000,
+                           "path": str(path), "initial_skip_bytes": 0})  # same name: Zeek reuses it every hour
+    assert source.poll(now=100) == 1
+    assert {row["event_type"] for row in store.source_events("SURICATA")} == {"flow"}
     source.close()
     store.close()
 
@@ -290,7 +308,8 @@ def test_live_file_is_read_before_a_rotated_backlog(tmp_path):
     store.close()
 
 
-@pytest.mark.parametrize("source,event_type", [("SURICATA", None), ("SURICATA", "stats"), ("CONTROL", "arp")])
+@pytest.mark.parametrize("source,event_type", [("SURICATA", None), ("SURICATA", "stats"), ("CONTROL", "arp"),
+                                               ("WAZUH", "alert")])
 def test_collector_startup_latest_record_lookup_is_one_index_seek(tmp_path, source, event_type):
     # Collectors read the newest record at startup; a scan+sort here held a read for hours on a 6 GB store.
     store = DurableIncidentStore(tmp_path / "security.db", sensor_id="sensor-a")
@@ -319,5 +338,42 @@ def test_unterminated_giant_record_is_bounded_per_poll(tmp_path, monkeypatch):
     for now in range(101, 106):
         source.poll(now=now)
     assert len(store.source_events("SURICATA", event_type="dns")) == 1
+    source.close()
+    store.close()
+
+
+def test_reread_after_unclean_power_off_keeps_dismissed_cases_closed(tmp_path):
+    # Sensor 2026-10-16: power-off left a NUL hole in the EVE tail, the anchor stopped
+    # matching, the day's file was re-read from 0 and every old alert reopened its case.
+    path = tmp_path / "eve.json"
+    append(path, record("alert", timestamp=100, alert={"signature": "old", "signature_id": 1}),
+           record("flow", timestamp=101, padding="x" * 200))
+    store, source = collector(tmp_path)
+    source.poll(now=100)
+    (case,) = store.snapshot()
+    store.set_incident_status(case["incident_id"], "Dismissed")
+    data = bytearray(path.read_bytes())
+    data[-100:-1] = b"\0" * 99
+    path.write_bytes(bytes(data))
+    assert source.poll(now=200) >= 1
+    cases = {case["action"]: case for case in store.snapshot()}
+    assert cases["SURICATA_ALERT"]["status"] == "Dismissed" and cases["SURICATA_ALERT"]["count"] == 1
+    assert cases["SOURCE_COLLECTION_ERROR"]["status"] == "Open"  # The damage itself still shows.
+    source.close()
+    store.close()
+
+
+def test_engine_and_ip_echo_events_are_recorded_acknowledged(tmp_path):
+    path = tmp_path / "eve.json"
+    append(path, record("alert", timestamp=100, alert={"signature": "SURICATA STREAM excessive retransmissions",
+                                                        "signature_id": 2210054, "severity": 3,
+                                                        "category": "Generic Protocol Command Decode"}),
+           record("alert", timestamp=101, alert={"signature": "ET INFO Observed External IP Lookup Domain",
+                                                  "signature_id": 2054155, "severity": 1,
+                                                  "category": "Device Retrieving External IP Address Detected"}))
+    store, source = collector(tmp_path)
+    source.poll(now=100)
+    assert {(c["severity"], c["status"]) for c in store.snapshot()} == {("info", "Resolved")}
+    assert store.open_count() == 0
     source.close()
     store.close()

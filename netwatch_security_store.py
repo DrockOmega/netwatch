@@ -23,6 +23,7 @@ from netwatch_history import _FILTERS as HISTORY_FILTERS
 from netwatch_history import HistoryStore
 from netwatch_incidents import (
     _CLOSED_INCIDENT_STATUSES,
+    INFO_CLOSURE_REASON,
     SEVERITY_RANK,
     Incident,
     IncidentStore,
@@ -176,7 +177,7 @@ def _warn_still_holding(thread_id, store):
     Reads the store's own flag, never the connection: conn.in_transaction from this timer
     thread waited on SQLite's connection mutex while the writer sat in BEGIN's busy wait,
     holding the GIL and freezing every thread of the process for the whole busy timeout
-    (~32 s with the evidence catalog's 30 s, the sniffer stalls on the sensor 2026-10-11/12)."""
+    (~32 s with the evidence catalog's 30 s, the sniffer stalls on Sensor 2026-10-11/12)."""
     import traceback
     frame = sys._current_frames().get(thread_id)
     if frame is not None and store._holding:  # still waiting in BEGIN is not a hold
@@ -186,6 +187,12 @@ def _warn_still_holding(thread_id, store):
 
 WAL_MAX_BYTES = 67_108_864  # same 64 MiB cap as DB_WAL_MAX_BYTES for the ledger and spool
 
+
+CONTROL_PRUNE_MAX_BATCH = 1000  # rows one control prune pass may delete under the writer lock
+# Over quota the prune walks the order table, which interleaves every source: one unbounded
+# 1000-row CONTROL window read 29M sequences in 132 s on the sensor and wedged the collector (b543).
+PRUNE_WALK_SPAN = 100_000  # order sequences one over-quota window read may cross
+PRUNE_WALK_SEC = 2.0  # walk time one prune call may spend before it hands the turn back
 
 class DurableIncidentStore:
     """Commit source detections and correlated cases before acknowledgment.
@@ -217,6 +224,7 @@ class DurableIncidentStore:
         # per thread if measured alert throughput makes this lock a bottleneck.
         self._lock = threading.RLock()
         self._holding = False  # inside BEGIN..COMMIT; read by the slow-write timer instead of the connection
+        self.held_sec = 0.0  # total writer-lock hold of this store's transactions; paces retention's rest
         self._gap_detected = {}  # (spool_id, gap_id) -> monotonic time of the last gap detection
         self.conn = sqlite3.connect(path, isolation_level=None, timeout=5, check_same_thread=False)
         if path != ":memory:" and os.name == "posix":
@@ -484,7 +492,9 @@ class DurableIncidentStore:
                     raise
                 finally:
                     self._holding = False
-                    _warn_slow_write(time.monotonic() - began)
+                    held = time.monotonic() - began
+                    self.held_sec += held
+                    _warn_slow_write(held)
             finally:
                 watchdog.cancel()
 
@@ -577,6 +587,8 @@ class DurableIncidentStore:
             case[name] = previous.get(name, default)
         if previous.get("status") in _CLOSED_INCIDENT_STATUSES and case["status"] == "Open":
             case["closure_reason"] = ""
+        elif not previous and case["status"] == "Resolved":
+            case["closure_reason"] = INFO_CLOSURE_REASON
         self._write_case(correlation_key, case)
         self.conn.execute("""
             INSERT INTO security_detections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1031,49 +1043,68 @@ class DurableIncidentStore:
                     AND c.status NOT IN ('Resolved','Recovered','Dismissed') AND n.value IS NOT NULL)
                 {evidence_pin} {newest_pin}) AS prunable
                 FROM (SELECT o.sequence, o.event_id FROM security_source_order o {join} security_source_events s
-                    ON s.event_id=o.event_id WHERE o.sequence>? AND s.source=? AND s.event_type!='collector_gap' {only}
+                    ON s.event_id=o.event_id WHERE o.sequence>? AND o.sequence<=? AND s.source=?
+                    AND s.event_type!='collector_gap' {only}
                     AND (? OR (? > 0 AND s.received_at < ?))
                     AND NOT (? AND s.event_type='arp' AND o.sequence>?)
                     ORDER BY o.sequence LIMIT ?) w
                 CROSS JOIN security_source_events s ON s.event_id=w.event_id ORDER BY w.sequence"""
-        limit = max(1, min(1000, int(batch)))
+        limit = max(1, min(CONTROL_PRUNE_MAX_BATCH, int(batch)))
+        top = self._read("SELECT COALESCE(MAX(sequence),0) FROM security_source_order")[0][0]
+        floor_key = f"PRUNE_FLOOR:{source}"
+        walk_cut = False
 
-        def select(only="", ids=(), after=0):
+        def select(only="", ids=(), after=0, until=None):
+            nonlocal walk_cut
             cursor = self.cursor("ANALYSIS:ARP:v1") or {"sequence": 0}
             # Over quota every row is a candidate, so walk the order table from the oldest and stop
             # at the window; under quota only expired rows qualify and the source index finds them.
             # The re-check seeks its ids through the order table instead of rescanning the source.
             sql = query.format(only=only, evidence_pin=evidence_pin, newest_pin=newest_pin,
                                join="CROSS JOIN" if over or only else "JOIN")
-            picked, first = [], None
+            walk = over and until is None
+            deadline = time.monotonic() + PRUNE_WALK_SEC
+            picked = []
             while True:
+                upto = min(top, after + PRUNE_WALK_SPAN) if walk else top if until is None else until
                 with self._lock:
-                    window = self.conn.execute(sql, (after, source, *ids, int(bool(over)), retention_days,
+                    window = self.conn.execute(sql, (after, upto, source, *ids, int(bool(over)), retention_days,
                                                      now - retention_days * 86400, int(bool(arp_enabled)),
                                                      int(cursor["sequence"]), limit)).fetchall()
-                if first is None and window:
-                    first = window[0]["sequence"]
                 picked += [row for row in window if row["prunable"]]
-                if len(picked) >= limit or len(window) < limit:
-                    if over and not only and first is not None:
-                        # Over quota the walk starts at the source's oldest candidate, pinned or not, so
-                        # the next pass need not re-walk the other sources' rows below it (264k SURICATA
-                        # order rows, 5 s a batch, on the sensor). ARP rows past the cursor are filtered out
-                        # now but qualify once it advances, so the floor never passes the cursor.
-                        self._prune_floor[source] = min(first - 1, int(cursor["sequence"])) if arp_enabled \
-                            else first - 1
-                    return picked[:limit]
-                after = window[-1]["sequence"]  # A fully pinned window is stepped past, never re-read.
+                if not walk:
+                    if len(picked) >= limit or len(window) < limit:
+                        return picked[:limit]
+                    after = window[-1]["sequence"]
+                    continue
+                # The floor is where the next over-quota pass resumes: every row at or below it was
+                # pinned or is picked now. Pinned rows it passes go by age; the end of the table resets it.
+                if len(picked) >= limit:
+                    floor = picked[limit - 1]["sequence"]
+                elif len(window) < limit and upto >= top:
+                    floor = 0
+                elif time.monotonic() >= deadline:
+                    walk_cut, floor = True, window[-1]["sequence"] if len(window) == limit else upto
+                else:
+                    after = window[-1]["sequence"] if len(window) == limit else upto
+                    continue
+                # Unprocessed ARP rows it passes are pins like any other; clamping to a lagging cursor stalled a cut walk.
+                self._prune_floor[source] = floor
+                return picked[:limit]
 
-        first_pass = select(after=self._prune_floor.get(source, 0) if over else 0)
+        if source not in self._prune_floor:  # Persisted: a restart re-walked from 0 and wedged (b543).
+            self._prune_floor[source] = int((self.cursor(floor_key) or {"sequence": 0})["sequence"])
+        first_pass = select(after=self._prune_floor[source] if over else 0)
         ids = [row["event_id"] for row in first_pass]
         if not ids:
-            return {"rows": rows, "payload_bytes": size, "pruned": 0,
-                    "over_quota": bool(over), "protected_or_pending": bool(over)}
+            return {"rows": rows, "payload_bytes": size, "pruned": 0, "full": walk_cut,
+                    "over_quota": bool(over), "protected_or_pending": bool(over and not walk_cut)}
         with self._transaction():
             # Re-check the pins under the lock: a hold or binding may have landed since.
             candidates = select(f"AND o.event_id IN ({','.join('?' * len(ids))})", ids,
-                                after=min(row["sequence"] for row in first_pass) - 1)
+                                after=min(row["sequence"] for row in first_pass) - 1,
+                                until=max(row["sequence"] for row in first_pass))
+            self._checkpoint(floor_key, {"sequence": self._prune_floor[source]})
             removed = []
             for row in candidates:
                 expired = retention_days > 0 and row["received_at"] < now - retention_days * 86400
@@ -1101,7 +1132,10 @@ class DurableIncidentStore:
                                   (now, f"{source.lower()}-retention", "prune", _encode({"source": source, "event_ids": removed,
                                    "max_rows": max_rows, "max_bytes": max_bytes, "retention_days": retention_days})))
             over = (max_rows > 0 and rows > max_rows) or (max_bytes > 0 and size > max_bytes)
+            # Full against the clamped batch, not the configured one: a configured batch over the
+            # clamp never filled, so the caller ran one pass a minute .
             return {"rows": rows, "payload_bytes": size, "pruned": len(removed),
+                    "full": len(removed) >= limit or walk_cut,
                     "over_quota": bool(over), "protected_or_pending": bool(over and not removed)}
 
     def prune_metadata(self, *, retention_days=30, case_retention_days=365, batch_rows=1000,
@@ -1139,10 +1173,10 @@ class DurableIncidentStore:
             statements += [
                 """DELETE FROM security_native_pruned WHERE event_id IN (SELECT event_id
                    FROM security_native_pruned WHERE pruned_at < :native_cutoff AND (pruned_at < :cutoff
-                   OR json_extract(body,'$.source') IN ('SURICATA','CONTROL')) LIMIT :limit)""",
+                   OR json_extract(body,'$.source') IN ('SURICATA','ZEEK','WAZUH','CONTROL')) LIMIT :limit)""",
                 """DELETE FROM security_native_audit WHERE sequence IN (SELECT sequence
                    FROM security_native_audit WHERE operation='prune' AND timestamp < :native_cutoff
-                   AND (timestamp < :cutoff OR json_extract(body,'$.source') IN ('SURICATA','CONTROL'))
+                   AND (timestamp < :cutoff OR json_extract(body,'$.source') IN ('SURICATA','ZEEK','WAZUH','CONTROL'))
                    ORDER BY sequence LIMIT :limit)""",
             ]
         if case_retention_days > 0:
@@ -1233,8 +1267,10 @@ class DurableIncidentStore:
         """``(rows, scanned_to)``: rows after ``after`` in commit order, and the sequence the scan
         covered. Walks the order table forward from the cursor, so cost tracks unread records,
         not retained ones; a consumer checkpoints ``scanned_to`` to step over other streams' rows.
+        ``event_type`` may be a tuple: those streams interleaved in commit order.
         """
         after, limit = int(after), max(1, min(1000, int(limit)))
+        types = (event_type,) if isinstance(event_type, str) else tuple(event_type)
         # Committed sequences form a gap-free prefix (writes serialize), so the
         # snapshot's maximum bounds what a later snapshot could add below it.
         top = self._read("SELECT COALESCE(MAX(sequence), 0) FROM security_source_order")[0][0]
@@ -1242,8 +1278,9 @@ class DurableIncidentStore:
         rows = [dict(row) | {"normalized": json.loads(row["normalized"]), "native": json.loads(row["native"])}
                 for row in self._read("""SELECT o.sequence, s.* FROM security_source_order o
                     CROSS JOIN security_source_events s ON s.event_id=o.event_id
-                    WHERE o.sequence>? AND o.sequence<=? AND s.source=? AND s.event_type=?
-                    ORDER BY o.sequence LIMIT ?""", (after, until, source, event_type, limit))]
+                    WHERE o.sequence>? AND o.sequence<=? AND s.source=?
+                    AND s.event_type IN (SELECT value FROM json_each(?))
+                    ORDER BY o.sequence LIMIT ?""", (after, until, source, json.dumps(types), limit))]
         return rows, (rows[-1]["sequence"] if len(rows) == limit else max(after, until))
 
     def record_source_health(self, source_key, body, now=None):

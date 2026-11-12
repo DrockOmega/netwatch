@@ -137,9 +137,7 @@ def test_backup_refuses_occupied_or_nested_output(tmp_path, runtime):
     assert main(["verify", str(tmp_path / "cli")]) == 0
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX modes; Windows relies on the base directory ACL")
 def test_backup_is_owner_only_on_posix(tmp_path, runtime):
-    import os
     base, _ = runtime
     old = os.umask(0o022)
     try:

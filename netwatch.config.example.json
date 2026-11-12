@@ -5,15 +5,15 @@
     "  netwatch_config.DEFAULTS  ->  netwatch.config.json  ->  netwatch.<hostname>.json  ->  $NETWATCH_CONFIG",
     "Only name the keys you are changing; everything else falls through to the layer below.",
     "Unknown keys are reported at boot and ignored, so a typo cannot silently do nothing.",
-    "Relative paths resolve next to main.py (or the frozen exe); absolute paths are used verbatim.",
-    "Enumerate NIC names with:",
-    "  python -c \"from scapy.arch.windows import get_windows_if_list; [print(i['name'],'|',i['description']) for i in get_windows_if_list()]\""
+    "Relative paths resolve next to main.py; absolute paths are used verbatim.",
+    "Enumerate NIC names with: ip -br link"
   ],
 
-  "NIC_INTERFACE": "Realtek Gaming USB 2.5GbE Family Controller",
+  "NIC_INTERFACE": "eth0",
   "INCIDENT_DB": "telemetry_security.db",
   "CAPTURE_PROFILE": "full",
   "BPF_FILTER": null,
+  "BULK_SHED_BYTES": 0,
 
   "_comment_ipv6": [
     "The ISP delegates a globally-routable prefix to your LAN, so nothing structural",
@@ -42,7 +42,7 @@
   "SPOOL_RETRY_INTERVAL_SEC": 1.0,
   "DISK_MIN_FREE_BYTES": 2147483648,
   "METADATA_RETENTION_DAYS": 30,
-  "CASE_RETENTION_DAYS": 365,
+  "CASE_RETENTION_DAYS": 30,
   "NATIVE_RETENTION_DAYS": 7,
   "NATIVE_MAX_ROWS": 1000000,
   "NATIVE_MAX_BYTES": 1073741824,
@@ -60,7 +60,7 @@
   "PCAP_UI_ALERT_INTERVAL_SEC": 60,
   "PCAP_RECOVERY_SAMPLES": 2,
 
-  "_comment_detectors": "Windows are divided into DETECTOR_BUCKETS sub-buckets; resolution is window/buckets and memory is O(buckets), not O(threshold).",
+  "_comment_detectors": "Time windows are divided into DETECTOR_BUCKETS sub-buckets; resolution is window/buckets and memory is O(buckets), not O(threshold).",
   "DETECTOR_BUCKETS": 20,
   "MAX_ENTITIES": 2048,
   "ARENA_ALERT_INTERVAL_SEC": 60,
@@ -130,6 +130,16 @@
   "_comment_suricata": "Optional local EVE JSON tail; point this at a Suricata sensor output when installed.",
   "SURICATA_EVE_ENABLED": false,
   "SURICATA_EVE_START_AT_END": false,
+  "_comment_zeek": "Optional Zeek JSON logs (LogAscii::use_json=T). Each entry is a path or glob of uncompressed logs; compressed archives are not read.",
+  "ZEEK_LOGS_ENABLED": false,
+  "ZEEK_LOG_PATHS": ["zeek/*.log"],
+  "ZEEK_START_AT_END": false,
+  "_comment_wazuh": "Optional Wazuh manager alerts.json (the netwatch user must be able to read it, e.g. SupplementaryGroups=wazuh). Rules at or above WAZUH_MIN_ALERT_LEVEL become detections.",
+  "WAZUH_ALERTS_ENABLED": false,
+  "WAZUH_ALERTS_PATH": "wazuh/alerts.json",
+  "WAZUH_START_AT_END": false,
+  "WAZUH_AGENT_ADDRESSES": {},
+  "WAZUH_MIN_ALERT_LEVEL": 7,
 
   "_comment_exposure": "CIDRs NetWatch owns, for a later active exposure scan. Validated at startup; nothing scans yet.",
   "EXPOSURE_OWNED_SCOPES": ["10.0.0.0/24"],
@@ -138,7 +148,6 @@
   "RESPONSE_MODE": "ids_only",
   "_comment_mitigation": "Firewall-block a bad EXTERNAL IP on this host. The engine is live and approval-gated in ready mode. See SECURITY.md.",
   "MITIGATION_ENABLED": true,
-  "MITIGATION_DRY_RUN": false,
 
   "_comment_quarantine": [
     "Sever a LOCAL device via ARP poisoning from this host — the enforcement point",

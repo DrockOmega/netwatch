@@ -50,4 +50,5 @@ def test_informational_priority_one_rule_is_not_critical():
     assert sev("ET USER_AGENTS Steam HTTP Client User-Agent", "Potential Corporate Privacy Violation") == "info"
     assert sev("ET INFO Possible Kali Linux hostname in DHCP Request Packet") == "alert"
     assert sev("Custom rule", "Potential Corporate Privacy Violation") == "info"
+    assert sev("GPL CHAT Jabber/Google Talk Outgoing Traffic", "Not Suspicious Traffic") == "info"
     assert sev("ET DOS Possible SSDP Amplification Scan in Progress") == "critical"

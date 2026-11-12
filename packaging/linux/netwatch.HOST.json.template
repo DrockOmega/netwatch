@@ -1,0 +1,7 @@
+{
+  "_comment": "Linux sensor keys for netwatch.<hostname>.json in /var/lib/netwatch. Merge over the restored overlay (INSTALL.md), then replace REPLACE_WITH_IFACE with the mirror NIC name.",
+  "NIC_INTERFACE": "REPLACE_WITH_IFACE",
+  "SURICATA_EVE_ENABLED": true,
+  "SURICATA_EVE_PATH": "/var/lib/suricata/eve.json",
+  "SURICATA_EVE_START_AT_END": true
+}

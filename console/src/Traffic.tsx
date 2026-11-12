@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getJson, NodeView } from "./gateway";
+import { GeoMap } from "./GeoMap";
 
 interface Row {
   host?: string;
@@ -137,6 +138,7 @@ export function Traffic({ nodes }: { nodes: NodeView[] }) {
           <Timeline data={data.timeline} window={data.window} />
         </div>
       )}
+      <GeoMap node={node} window={choice.window} />
       {data && (
         <div className="tops">
           <Top title="Top sources" rows={data.sources} label={(r) => r.host ?? ""} />

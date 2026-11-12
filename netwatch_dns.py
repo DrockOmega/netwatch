@@ -100,7 +100,8 @@ def _is_skippable(qname):
     if not qname or qname == "encrypted-payload":
         return True
     q = qname.lower()
-    return any(q.endswith(suf) for suf in _SKIP_SUFFIXES)
+    # A single label is a LAN hostname (LLMNR/NetBIOS lookup of a PC name), never a registrable domain.
+    return "." not in q or any(q.endswith(suf) for suf in _SKIP_SUFFIXES)
 
 
 # Stored with a leading dot; matched against "." + qname, so an entry covers the name itself and its subdomains.
@@ -152,7 +153,7 @@ class DnsAnalyzer:
         self.ledger_path = ledger_path
         self.hosts = {}            # ip -> {queries, nxdomain, dga_hits, tunnel_hits, last_seen}
         self.recent = []           # capped list of recent flagged-domain dicts
-        self._nx_windows = {}      # ip -> deque[ts]  (in-memory only)
+        self._nx_windows = {}      # ip -> deque[(ts, qname)]  (in-memory only)
         self._cooldown = {}        # (kind, key) -> last_fire_ts
         self._dirty = False
         if ledger_path:
@@ -197,17 +198,25 @@ class DnsAnalyzer:
         elif qr == 1 and rcode == 3:  # NXDOMAIN response -> blame the querying host (dst)
             if any(f".{qname}".endswith(suffix) for suffix in self.ignore_suffixes):
                 return findings
+            # Service-discovery probes (apt's _https._tcp.<repo> SRV lookups) are NXDOMAIN on most hosts.
+            if str(qname or "").startswith("_"):
+                return findings
             host = self._host(dst_ip, now)
             host["nxdomain"] += 1
             self._dirty = True
             win = self._nx_windows.setdefault(dst_ip, deque(maxlen=self.nxdomain_threshold + 1))  # only len > threshold is tested
-            win.append(now)
+            name = str(qname or "")
+            for seen in [e for e in win if e[1] == name]:  # a retried name is one name: a DGA needs many (b252)
+                win.remove(seen)
+            win.append((now, name))
             cutoff = now - self.nxdomain_window_sec
-            while win and win[0] < cutoff:
+            while win and win[0][0] < cutoff:
                 win.popleft()
             if len(win) > self.nxdomain_threshold and self._fire(NXDOMAIN_BURST, dst_ip, now):
+                # A few of the failed names, so triage can tell a DGA from a misconfigured app.
+                samples = ", ".join(list(dict.fromkeys(name[:60] for _, name in reversed(win)))[:3])
                 findings.append({"kind": NXDOMAIN_BURST, "severity": "alert", "host": dst_ip,
-                                 "message": f"DNS NXDOMAIN BURST: {dst_ip} got >{self.nxdomain_threshold} NXDOMAIN in {self.nxdomain_window_sec}s (DGA/C2 footprint)"})
+                                 "message": f"DNS NXDOMAIN BURST: {dst_ip} got >{self.nxdomain_threshold} NXDOMAIN in {self.nxdomain_window_sec}s (DGA/C2 footprint): {samples}"})
 
         return findings
 

@@ -1,0 +1,11 @@
+# Local rules merged by suricata-update (netwatch-suricata-update.sh --local). Local SIDs 1000000-1999999.
+# 1014819 = ET 2014819 rev 5 minus Microsoft update CDNs (b613): it fired 100+ times per Windows Update, Edge or Xbox
+# download over plain HTTP on shared Fastly/Akamai addresses that threshold.config cannot scope. Suricata will not mix
+# request and response buffers in one rule, so the request's Host sets a flowbit; a forged Host only evades this INFO rule.
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NetWatch Microsoft update CDN request"; flow:established,to_server; http.host; content:".windowsupdate.com"; endswith; flowbits:set,nw.mscdn; flowbits:noalert; classtype:misc-activity; sid:1014820; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NetWatch Microsoft update CDN request"; flow:established,to_server; http.host; content:".delivery.mp.microsoft.com"; endswith; flowbits:set,nw.mscdn; flowbits:noalert; classtype:misc-activity; sid:1014821; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"NetWatch Microsoft update CDN request"; flow:established,to_server; http.host; content:".xboxlive.com"; endswith; flowbits:set,nw.mscdn; flowbits:noalert; classtype:misc-activity; sid:1014822; rev:1;)
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"ET INFO Packed Executable Download"; flow:established,to_client; flowbits:isnotset,nw.mscdn; file.data; content:"MZ"; startswith; isdataat:100,relative; content:"This program "; distance:0; content:"PE|00 00|"; distance:0; content:!"data"; within:400; content:!"text"; within:400; content:!"rsrc"; within:400; classtype:misc-activity; sid:1014819; rev:1; metadata:netwatch_base 2014819 rev 5;)
+# 1062715 = ET 2062715 rev 1 minus Xbox Live: Xbox consoles fetch gamerpics over plain HTTP from dlassets.xboxlive.com
+# on shared Fastly addresses with an IE Mobile UA that sends UA-CPU (case 09be6d, 11-03).
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"ET INFO Observed UA-CPU Header"; flow:established,to_server; http.host; content:!".xboxlive.com"; endswith; http.header_names; to_lowercase; content:"|0d 0a|ua-cpu|0d 0a|"; threshold: type limit, track by_src, seconds 180, count 1; classtype:misc-activity; sid:1062715; rev:1; metadata:netwatch_base 2062715 rev 1;)

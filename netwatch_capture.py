@@ -1,6 +1,6 @@
 """High-throughput capture parsing, socket tuning, and loss accounting.
 
-NetWatch owns the Npcap handle, enlarges its kernel buffer, and reads raw frames
+NetWatch owns the libpcap handle, enlarges its ring buffer, and reads raw frames
 with ``recv_raw()``. Building a full Scapy object graph for every packet pinned
 the capture process to one CPU core at 14k packets/s and caused sustained driver
 loss. The bounded parser below extracts only the Ethernet/ARP/IP/TCP/UDP/DNS/TLS
@@ -14,7 +14,6 @@ normal listener and the platform's default buffering policy.
 
 import math
 import struct
-import sys
 import threading
 import time
 
@@ -106,11 +105,26 @@ def _parse_dns(payload):
     qr = (flags >> 15) & 1
     rcode = flags & 0x0F
     qtype = qname = None
+    answers = []
     if questions:
         qname, offset = _dns_name(payload, 12)
         if offset is not None and offset + 4 <= len(payload):
             qtype = struct.unpack_from("!H", payload, offset)[0]
-    return {"qr": qr, "rcode": rcode, "qtype": qtype, "qname": qname}
+            offset += 4
+            if qr and questions == 1:
+                # A and AAAA answers, so a later connection without SNI can still be named.
+                for _ in range(min(struct.unpack_from("!H", payload, 6)[0], 32)):
+                    _, offset = _dns_name(payload, offset)
+                    if offset is None or offset + 10 > len(payload):
+                        break
+                    rtype, _, _, rdlength = struct.unpack_from("!HHIH", payload, offset)
+                    offset += 10
+                    if offset + rdlength > len(payload):
+                        break
+                    if (rtype, rdlength) in ((1, 4), (28, 16)) and len(answers) < 16:
+                        answers.append(bytes(payload[offset:offset + rdlength]))
+                    offset += rdlength
+    return {"qr": qr, "rcode": rcode, "qtype": qtype, "qname": qname, "answers": answers}
 
 
 def _ipv6_transport(frame, offset, next_header, packet_end):
@@ -256,6 +270,7 @@ def parse_ethernet_frame(frame, timestamp=None, tls_fingerprint=None):
 
     sni_domain = "encrypted-payload"
     dns_qr = dns_rcode = dns_qtype = dns_qname = None
+    dns_answers = ()
     if payload and (sport in (53, 5353, 5355) or dport in (53, 5353, 5355)):
         dns_payload = payload
         if protocol == 6:
@@ -271,6 +286,7 @@ def parse_ethernet_frame(frame, timestamp=None, tls_fingerprint=None):
         if dns:
             dns_qr, dns_rcode = dns["qr"], dns["rcode"]
             dns_qtype, dns_qname = dns["qtype"], dns["qname"]
+            dns_answers = tuple(dns["answers"])
             if dns_qr == 0 and dns_qname:
                 sni_domain = dns_qname
 
@@ -312,9 +328,9 @@ def parse_ethernet_frame(frame, timestamp=None, tls_fingerprint=None):
         "timestamp": captured_at, "mac_src": mac_src, "mac_dst": mac_dst,
         "src_ip": src_ip, "dst_ip": dst_ip, "protocol": protocol_name,
         "port": dport, "tcp_flags": tcp_flags, "ttl": ttl,
-        "size_bytes": len(frame), "sni_domain": sni_domain,
+        "size_bytes": len(frame), "payload_bytes": len(payload), "sni_domain": sni_domain,
         "dns_qr": dns_qr, "dns_rcode": dns_rcode, "dns_qtype": dns_qtype,
-        "dns_qname": dns_qname, "ja3": ja3, "ja3s": ja3s, "ja4": ja4,
+        "dns_qname": dns_qname, "dns_answers": dns_answers, "ja3": ja3, "ja3s": ja3s, "ja4": ja4,
         "source_port": sport,
         "vlan_ids": vlan_ids, "ip_protocol": protocol,
         "fragmented": is_fragment, "non_initial_fragment": fragmented,
@@ -337,7 +353,7 @@ def open_capture_socket(interface, bpf_filter=None, buffer_bytes=0):
     kwargs = {"iface": interface}
     if bpf_filter:
         kwargs["filter"] = bpf_filter
-    if int(buffer_bytes) <= 0 or sys.platform == "win32":
+    if int(buffer_bytes) <= 0:
         return conf.L2listen(**kwargs)
     # libpcap sizes the Linux ring only between create and activate, and Scapy sets neither;
     # its 2 MB default holds ~128 of the mirror's coalesced frames, so any short stall dropped packets.
@@ -358,24 +374,9 @@ def open_capture_socket(interface, bpf_filter=None, buffer_bytes=0):
 
 
 def set_capture_buffer(sock, buffer_bytes):
-    """Set Npcap's activated kernel buffer with its Windows-specific API.
-
-    Returns ``True`` only when Npcap accepted the requested size. Other libpcap
-    platforms simply return ``False`` and retain their native buffering policy.
-    """
-    if getattr(sock, "buffer_preset", False):  # Linux: sized before activation by open_capture_socket.
-        return True
-    handle = getattr(getattr(sock, "pcap_fd", None), "pcap", None)
-    if handle is None or int(buffer_bytes) <= 0:
-        return False
-    try:
-        from scapy.libs.winpcapy import pcap_setbuff
-    except (ImportError, AttributeError):
-        return False
-    try:
-        return pcap_setbuff(handle, int(buffer_bytes)) == 0
-    except (OSError, ValueError, TypeError):
-        return False
+    """``True`` when open_capture_socket sized the ring before activation; libpcap
+    cannot resize it after."""
+    return bool(getattr(sock, "buffer_preset", False))
 
 
 def make_capture_dispatcher(sock, on_frame):

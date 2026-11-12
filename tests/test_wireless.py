@@ -139,3 +139,16 @@ def test_notify_failure_is_counted(store):
     assert ww.poll(now=NOW + 120) == 1
     assert store.open_count() == 1  # the detection is committed despite the failed notify
     assert ww.health()["notify_failures"] == 1
+
+
+def test_quiet_device_case_is_recorded_resolved_and_a_repeat_does_not_reopen_it():
+    from netwatch_core import make_message
+    from netwatch_incidents import IncidentStore
+    case = IncidentStore().add(make_message("WIRELESS", "WIRELESS_DEVICE_QUIET", "02:00:00:00:00:04",
+                                            {"message": "WIRELESS: 02:00:00:00:00:04 silent", "severity": "info"}))
+    assert case["status"] == "Resolved"
+    store = IncidentStore()
+    quiet = make_message("WIRELESS", "WIRELESS_DEVICE_QUIET", "02:00:00:00:00:04",
+                         {"message": "WIRELESS: 02:00:00:00:00:04 silent", "severity": "info"})
+    store.add(quiet)
+    assert store.add(quiet)["status"] == "Resolved"

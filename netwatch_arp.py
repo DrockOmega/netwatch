@@ -65,6 +65,7 @@ class ArpWatch:
         rebind_min_sec=2.0,
         rebind_window_sec=10.0,
         ignored_macs=(),
+        fanout_exempt_macs=(),
     ):
         self.gateway_ip = gateway_ip or ""
         self.mac_fanout_threshold = mac_fanout_threshold
@@ -74,6 +75,11 @@ class ArpWatch:
         self.rebind_window_sec = max(self.rebind_min_sec, float(rebind_window_sec))
         self.ignored_macs = {
             normalized for value in ignored_macs
+            if (normalized := normalize_mac(value))
+        }
+        # Multi-homed by design (a set-top box on LAN, link-local and its own subnet): fan-out only, rebinds still alert.
+        self.fanout_exempt_macs = {
+            normalized for value in fanout_exempt_macs
             if (normalized := normalize_mac(value))
         }
         self.bindings = {}   # ip -> {mac, first_seen, last_seen, flaps}
@@ -144,7 +150,7 @@ class ArpWatch:
 
         fanout = len(self.mac_ips.get(confirmed_mac, ())) if event != REBIND_CANDIDATE else 0
         is_gateway = bool(self.gateway_ip) and sender_ip == self.gateway_ip
-        suspicious = event == REBIND or fanout > self.mac_fanout_threshold
+        suspicious = event == REBIND or (fanout > self.mac_fanout_threshold and confirmed_mac not in self.fanout_exempt_macs)
         if is_gateway and event == REBIND:
             severity = "critical"
         elif suspicious:
@@ -290,6 +296,7 @@ class DurableArpAnalyzer:
                         rebind_min_sec=self.config.get("ARP_REBIND_MIN_SEC", 2),
                         rebind_window_sec=self.config.get("ARP_REBIND_WINDOW_SEC", 10),
                         ignored_macs=(self.config.get("QUARANTINE_SINK_MAC", "02:00:00:00:de:ad"),),
+                        fanout_exempt_macs=self.config.get("ARP_FANOUT_EXEMPT_MACS", ()),
                     )
                     watch.bindings = {ip: entry for ip, entry in state.get("bindings", {}).items()
                                       if entry["mac"] not in watch.ignored_macs}
@@ -315,8 +322,9 @@ class DurableArpAnalyzer:
                         ids[:1] + ids[-watch.rebind_confirmations:]))
                 if result and result["suspicious"] and result["event"] != REBIND:
                     # fan-out is a standing condition, not an event: one finding per MAC per cooldown
-                    last = self._fanout_seen.get((scope, result["mac"]))
-                    if last is not None and 0 <= claim["timestamp"] - last < FANOUT_COOLDOWN_SEC:
+                    # Not `last`: that is the replay sequence, and a timestamp there parked the cursor for good.
+                    seen = self._fanout_seen.get((scope, result["mac"]))
+                    if seen is not None and 0 <= claim["timestamp"] - seen < FANOUT_COOLDOWN_SEC:
                         result = None
                     else:
                         if len(self._fanout_seen) > 4096:

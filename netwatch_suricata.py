@@ -84,14 +84,18 @@ def classify_endpoints(src_ip, dst_ip, local_networks=()):
 
 # Priority-1 rules that only describe the traffic (app/OS identification, policy) stay "alert".
 _INFORMATIONAL_PREFIXES = ("ET INFO ", "ET POLICY ", "ET USER_AGENTS ", "ET HUNTING ", "ET GAMES ",
-                           "ET CHAT ", "ET P2P ", "GPL INFO ", "GPL POLICY ")
+                           "ET CHAT ", "ET P2P ", "GPL INFO ", "GPL POLICY ", "GPL CHAT ")
 
 
-_POLICY_CATEGORY = "Potential Corporate Privacy Violation"
+# Categories that describe the traffic, not a threat: policy/app identification, ET's own "not suspicious",
+# Suricata's stream/decoder/app-layer engine events (retransmissions, odd EtherTypes, out-of-window
+# packets), and public-IP echo lookups that phones and apps make all day (triaged 2026-10-16).
+_INFO_CATEGORIES = {"Potential Corporate Privacy Violation", "Not Suspicious Traffic",
+                    "Generic Protocol Command Decode", "Device Retrieving External IP Address Detected"}
 
 
 def _informational(signature, category):
-    return signature.startswith(_INFORMATIONAL_PREFIXES) or category == _POLICY_CATEGORY
+    return signature.startswith(_INFORMATIONAL_PREFIXES) or category in _INFO_CATEGORIES
 
 
 def _mitre(alert):
@@ -122,7 +126,7 @@ def normalize_eve_event(event, local_networks=()):
     action = str(alert.get("action") or verdict.get("action") or event_type).lower()
     severity_value = alert.get("severity")
     severity = "critical" if action in {"blocked", "drop", "reject"} else "alert"
-    if severity == "alert" and alert.get("category") == _POLICY_CATEGORY:
+    if severity == "alert" and alert.get("category") in _INFO_CATEGORIES:
         severity = "info"  # policy/app identification (Steam UA and the like), never a threat finding
     try:
         if int(severity_value) == 1 and not _informational(signature, alert.get("category")):
@@ -249,8 +253,9 @@ class EveCollector:
 
         def accept(key, cursor, native, reference):
             received = time.time() if now is None else float(now)
-            identity = [key, reference["generation"], reference["offset"], reference.get("sha256"),
-                        native.get("reason") if reference["length"] == 0 else None]
+            # A record is its bytes at its offset; a re-read after an anchor mismatch must not mint new events.
+            identity = [key, reference["generation"] if reference["length"] == 0 else None, reference["offset"],
+                        reference.get("sha256"), native.get("reason") if reference["length"] == 0 else None]
             event_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
             normalized = normalize_eve_record(native, event_id=event_id, sensor_id=self.store.sensor_id,
                                                reference=reference, received_at=received,
@@ -323,7 +328,9 @@ def suricata_eve_process(alert_queue, evidence_queue, config, worker_status_queu
     def notify(payload):
         try:
             try_put_drop_oldest(alert_queue, payload)
-            if config.get("EVIDENCE_CAPTURE_ENABLED", True) and payload["action"] == "SURICATA_ALERT":
+            # Info engine events (QUIC/stream errors) arrive by the thousand and flooded the recorder.
+            if (config.get("EVIDENCE_CAPTURE_ENABLED", True) and payload["action"] == "SURICATA_ALERT"
+                    and payload["data"].get("severity") != "info"):
                 try_put_no_drop(evidence_queue, make_message(
                     "SURICATA", "EVIDENCE_CAPTURE", "IO_WORKER",
                     {"trigger_ts": _event_time(payload["data"].get("timestamp"), time.time()), "action": "SURICATA_ALERT",

@@ -5,6 +5,8 @@ import sqlite3
 import pytest
 
 from tests.test_sources import append, collector, record
+from tests.test_zeek import collector as zeek_collector
+from tests.test_zeek import conn_id
 
 STATS = lambda packets, drops: {"capture": {"kernel_packets": packets, "kernel_drops": drops}}  # noqa: E731
 
@@ -139,4 +141,34 @@ def test_vanished_unread_file_reports_one_gap_and_drained_file_none(tmp_path):
     gaps = [row["native"] for row in store.source_events("SURICATA", event_type="collector_gap")
             if row["native"]["reason"] == "source_file_left_glob_unread"]
     assert len(gaps) == 1 and gaps[0]["unread_bytes_at_least"] == len(tail)
+    store.close()
+
+
+def test_zeek_stale_conn_outranks_errors_and_partial_write(tmp_path):
+    (tmp_path / "conn.log").write_text(json.dumps({"_path": "conn", "ts": 10, **conn_id()}) + "\n{")
+    store, source = zeek_collector(tmp_path)
+    source.poll(now=100)
+    os.utime(tmp_path / "conn.log", (0, 0))  # Quiet file: STALE, not LAGGING.
+    health = source.health(1000)
+    assert health["status"] == "STALE" and health["partial_lines"] == 1
+    source.error = "database is locked"
+    os.utime(tmp_path / "conn.log", (0, 0))  # Quiet file: STALE, not LAGGING.
+    health = source.health(1000)
+    assert health["status"] == "STALE" and health["errors"]
+    source.close()
+    store.close()
+
+
+def test_glob_rotated_file_ending_mid_line_is_finalized_while_the_live_file_continues(tmp_path):
+    # Sensor 2026-10-16: the power cut left conn.<stamp>-restart.log ending mid-record under conn*.log.
+    rotated, live = tmp_path / "eve.1.json", tmp_path / "eve.2.json"
+    rotated.write_bytes(json.dumps(record()).encode() + b"\n" + json.dumps(record())[:30].encode())
+    append(live, record())
+    os.utime(rotated, (1, 1))
+    store, source = collector(tmp_path, path=tmp_path / "eve.*.json")
+    source.poll(now=100)
+    rows = store.source_events("SURICATA", event_type="collector_error")
+    assert [row["native"]["reason"] for row in rows] == ["truncated_final_record"]
+    assert source.reader.partial_lines == 0
+    source.close()
     store.close()

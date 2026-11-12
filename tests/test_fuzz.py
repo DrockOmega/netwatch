@@ -21,10 +21,14 @@ from netwatch_core import is_message_payload
 from netwatch_ja3 import fingerprint
 from netwatch_security_store import DurableIncidentStore, _encode, _event_time
 from netwatch_suricata import EveCollector, normalize_eve_event, normalize_eve_record
+from netwatch_wazuh import WazuhCollector
+from netwatch_zeek import ZeekCollector, normalize_zeek_notice, normalize_zeek_record, zeek_log_type
 from tests.fuzzing import json_roundtrip, mutate_bytes, mutate_json, rng_for
 from tests.test_capture import SRC_MAC, dns_query, ethernet, ipv4, ipv6, tcp, udp
 from tests.test_control import dhcp6_frame, dhcp_frame, ra_frame
 from tests.test_ja3 import build_client_hello, build_server_hello
+from tests.test_wazuh import FIXTURES as WAZUH_SEEDS
+from tests.test_zeek import FIXTURES as ZEEK_SEEDS
 
 CLIENT_HELLO = build_client_hello()
 SERVER_HELLO = build_server_hello()
@@ -136,24 +140,48 @@ def test_event_time_rejects_integers_beyond_float_range():
     assert _event_time(-(10**400), None) is None
 
 
-def test_native_collector_never_stalls_on_hostile_lines(tmp_path):
-    rng = rng_for("lines-SURICATA")
+def test_zeek_normalizers_tolerate_hostile_records():
+    rng = rng_for("zeek")
+    for _ in range(1500):
+        native = json_roundtrip(mutate_json(rng, rng.choice(list(ZEEK_SEEDS.values()))))
+        if not isinstance(native, dict):
+            continue
+        log_type = zeek_log_type(native, "notice.log")
+        assert isinstance(log_type, str)
+        _check_envelope(normalize_zeek_record(native, log_type, event_id="e", sensor_id="s", reference={},
+                                              received_at=1.0, local_networks=LOCAL))
+        _check_detection(normalize_zeek_notice(native, LOCAL))
+
+
+def test_zeek_log_type_tolerates_unhashable_event_type():
+    assert zeek_log_type({"event_type": [], "_path": "dns"}, "conn.log") == "dns"
+
+
+@pytest.mark.parametrize("source", ["SURICATA", "ZEEK", "WAZUH"])
+def test_native_collector_never_stalls_on_hostile_lines(tmp_path, source):
+    rng = rng_for("lines-" + source)
+    seeds = {"SURICATA": EVE_SEEDS, "ZEEK": list(ZEEK_SEEDS.values()), "WAZUH": list(WAZUH_SEEDS.values())}[source]
     lines = list(POISON_LINES)
     for _ in range(120):
         if rng.random() < 0.5:
-            lines.append(json.dumps(mutate_json(rng, rng.choice(EVE_SEEDS))))
+            lines.append(json.dumps(mutate_json(rng, rng.choice(seeds))))
         else:
-            raw = mutate_bytes(rng, json.dumps(rng.choice(EVE_SEEDS)).encode()).replace(b"\n", b" ")
+            raw = mutate_bytes(rng, json.dumps(rng.choice(seeds)).encode()).replace(b"\n", b" ")
             lines.append(raw.decode("utf-8", errors="replace"))
-    path = tmp_path / "eve.json"
+    path = tmp_path / {"SURICATA": "eve.json", "ZEEK": "conn.log", "WAZUH": "alerts.json"}[source]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     store = DurableIncidentStore(tmp_path / "security.db", sensor_id="fuzz")
-    collector = EveCollector(store, {"SURICATA_EVE_PATH": str(path), "DISK_MIN_FREE_BYTES": 0,
-                                     "LOCAL_PREFIXES": ["10.0.0.0/8"]})
+    config = {"DISK_MIN_FREE_BYTES": 0, "LOCAL_PREFIXES": ["10.0.0.0/8"]}
+    if source == "SURICATA":
+        collector = EveCollector(store, {"SURICATA_EVE_PATH": str(path), **config})
+    elif source == "WAZUH":
+        collector = WazuhCollector(store, {"WAZUH_ALERTS_PATH": str(path), **config})
+    else:
+        collector = ZeekCollector(store, {"ZEEK_LOG_PATHS": [str(path)], **config})
     try:
         consumed = sum(collector.poll() for _ in range(3))  # a stalled record raises here
         assert consumed == len(lines)
-        records = store.source_events("SURICATA", limit=1000)
+        records = store.source_events(source, limit=1000)
         assert len(records) == len(lines)
         rejected = [r for r in records if r["native"].get("reason") == "invalid_native_json"]
         assert len(rejected) >= 3  # the deep, too-deep and surrogate poison lines are kept as errors

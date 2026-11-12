@@ -31,6 +31,7 @@ CLOSED_STATUSES = ("Resolved", "Recovered", "Dismissed")
 CLOSED_ACTION_STATES = ("denied", "failed", "released", "expired")
 CASES_LIMIT = 2000  # closed rows beyond this drop out of the listing only; the cache keeps them
 ACTIONS_LIMIT = 1000
+PRUNE_INTERVAL = 3600
 CASE_COLUMNS = ("incident_id", "title", "target", "severity", "status", "confidence", "count",
                 "first_seen", "last_seen", "action", "assignment", "acknowledged_by")
 WRITE_ENDPOINTS = {"/api/case": "cases", "/api/action": "actions", "/api/response-mode": "response-mode"}
@@ -101,8 +102,7 @@ class Node:
 class Cache:
     """The gateway's copy of every sensor's cases and actions, advanced only by the sensor's feed.
 
-    shortcut: rows a sensor prunes stay here until that sensor's feed reports a reset;
-    add a retention pass if the cache outgrows the sensors.
+    The feed carries no deletes, so ``prune`` applies each sensor's reported closed-case retention here.
     """
 
     SCHEMA = """
@@ -225,6 +225,37 @@ class Cache:
             rows = self.conn.execute("SELECT * FROM writes ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         names = ("id", "at", "origin", "node", "endpoint", "request", "outcome", "reply")
         return [dict(zip(names, row, strict=True)) for row in rows]
+
+    def prune(self, retention_days, now=None):
+        """Drop closed cases past each node's retention with their detections and audit, unless a cached action names one.
+
+        ``retention_days`` maps node to the ``case_retention_days`` its health reports; 0 or unknown skips the node.
+        The sensor also keeps cases pinned by evidence or a native hold; those outlive the 7-day
+        evidence window only under a hold, so here they drop out a little early.
+        """
+        now = time.time() if now is None else now
+        old = f"""SELECT node, incident_id FROM cases c WHERE node=? AND status IN {CLOSED_STATUSES} AND last_seen < ?
+            AND NOT EXISTS (SELECT 1 FROM actions a WHERE a.node=c.node
+                            AND json_extract(a.body, '$.case_id')=c.incident_id)"""
+        removed = 0
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                for node, days in retention_days.items():
+                    if not days:
+                        continue
+                    params = (node, now - days * 86400)
+                    for table in ("detections", "case_audit"):
+                        self.conn.execute(f"DELETE FROM {table} WHERE (node, incident_id) IN ({old})", params)
+                    removed += self.conn.execute(f"DELETE FROM cases WHERE (node, incident_id) IN ({old})",
+                                                 params).rowcount
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+            if removed:
+                self.version += 1
+        return removed
 
     def open_count(self, node):
         with self.lock:
@@ -470,6 +501,15 @@ class Gateway:
                     except Exception:  # noqa: BLE001 - HTTP 400 from the sensor or unreachable
                         return self._send(502, {"error": "sensor could not answer"})
                     return self._send(200, traffic)
+                if url.path == "/api/geo":
+                    node = next((node for node in gateway.nodes if node.name == query.get("node")), None)
+                    if node is None:
+                        return self._send(404, {"error": "no such sensor"})
+                    try:
+                        geo = read_live(node, ("geo",), timeout=60, **{k: query[k] for k in ("window",) if k in query})["geo"]
+                    except Exception:  # noqa: BLE001 - HTTP 400 from the sensor or unreachable
+                        return self._send(502, {"error": "sensor could not answer"})
+                    return self._send(200, geo)
                 if self.path == "/api/actions":
                     return self._send(200, {"version": gateway.cache.version, "actions": gateway.cache.actions()})
                 if self.path == "/api/writes":
@@ -485,6 +525,7 @@ class Gateway:
         self.server.daemon_threads = True
 
     def _poll_loop(self):
+        pruned_at = None
         while not self._stop.is_set():
             for node in self.nodes:
                 try:
@@ -496,6 +537,14 @@ class Gateway:
                         self.announce(node, state)
                 except Exception:  # noqa: BLE001 - one bad page or locked cache must not end polling for good
                     logging.getLogger(__name__).exception("%s poll failed; retrying next cycle", node.name)
+            if pruned_at is None or time.monotonic() - pruned_at >= PRUNE_INTERVAL:
+                try:
+                    removed = self.cache.prune({node.name: node.health.get("case_retention_days") for node in self.nodes})
+                    if removed:
+                        logging.getLogger(__name__).info("cache retention: removed %d closed case(s)", removed)
+                except Exception:  # noqa: BLE001 - retention must never end polling
+                    logging.getLogger(__name__).exception("cache retention failed; retrying next hour")
+                pruned_at = time.monotonic()
             self._stop.wait(self.poll_interval)
 
     def start(self):

@@ -24,7 +24,8 @@ struct Terminal {
 #[derive(Default)]
 struct TerminalSlot(Mutex<Option<Terminal>>);
 
-const TERMINAL_COMMAND: &str = "exec claude";
+const TERMINAL_COMMAND: &str =
+    "exec claude";
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }

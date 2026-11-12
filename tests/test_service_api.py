@@ -83,12 +83,12 @@ def test_non_loopback_requires_explicit_config(service, caplog):
 
 
 def test_versioned_reads_workflow_and_preview_never_enforce(service, monkeypatch):
-    from netwatch_mitigation import WindowsFirewall
+    from netwatch_mitigation import RecordingFirewall
     from netwatch_quarantine import ArpQuarantineEffector, RecordingQuarantineEffector
 
     def forbidden(*args, **kwargs):
         pytest.fail("API called a response effector")
-    for cls in (WindowsFirewall, ArpQuarantineEffector, RecordingQuarantineEffector):
+    for cls in (RecordingFirewall, ArpQuarantineEffector, RecordingQuarantineEffector):
         monkeypatch.setattr(cls, "__init__", forbidden)
     api, client, _, _ = service
     case = api.store.add(make_message("sensor", "ALERT", "8.8.8.8", {"message": "fixture", "severity": "critical"}))
@@ -113,10 +113,10 @@ def test_versioned_reads_workflow_and_preview_never_enforce(service, monkeypatch
         assert result["data"] is not None
     assert client.request("sources")["data"][0]["normalized"]["event_id"] == "fixture"
     assert client.request("gaps")["data"]
-    assert client.request("cases", {"case": case["incident_id"], "assignment": "analyst", "acknowledge": True})["data"]
+    assert client.request("cases", {"case": case["incident_id"], "assignment": "operator", "acknowledge": True})["data"]
     audit = client.request("workflow", case=case["incident_id"])["data"][-1]
     assert audit["actor"] == "authenticated-console"
-    assert audit["body"]["assignment"] == "analyst"
+    assert audit["body"]["assignment"] == "operator"
     with pytest.raises(HTTPError):
         client.request("cases", {"case": case["incident_id"], "response": "enforce"})
     with pytest.raises(HTTPError):
@@ -165,12 +165,12 @@ def test_attached_console_uses_api_and_never_owns_effectors(service, monkeypatch
         assert window.incident_model.rowCount() == 1
         window._incident_selected(window.incident_model.index(0, 0))
         assert "service detection" in window.case_evidence.toPlainText()
-        window.case_assignment.setText("analyst")
+        window.case_assignment.setText("operator")
         window._save_case()
         deadline = time.monotonic() + 5  # case writes run off the GUI thread
         while window._effects_pending and time.monotonic() < deadline:
             app.processEvents()
-        assert api.store.get(case["incident_id"])["assignment"] == "analyst"
+        assert api.store.get(case["incident_id"])["assignment"] == "operator"
         assert window.mitigator is None and window.quarantine is None
         assert not window.mode_selector.isEnabled()
         window.started_at = 0
@@ -281,10 +281,11 @@ def test_health_names_the_sensor_and_its_response_mode(service):
 
     _, client, config, _ = service
     assert client.request('health')['data']['response_mode'] == 'ids_only'
-    config["SENSOR_ID"] = "sensor1-test"
+    config["SENSOR_ID"] = "sensor-test"
     save_response_mode(config["RESPONSE_MODE_LEDGER"], "ready")
     health = client.request('health')['data']
-    assert (health['sensor_id'], health['response_mode']) == ("sensor1-test", "ready")
+    assert (health['sensor_id'], health['response_mode']) == ("sensor-test", "ready")
+    assert health['case_retention_days'] == config.get("CASE_RETENTION_DAYS", 30)  # the gateway prunes its cache by it
     assert client.request('response-mode', {"mode": "autonomous"})['data'] == {"response_mode": "autonomous"}
     assert client.request('health')['data']['response_mode'] == "autonomous"
     for bad in ({"mode": "enforce"}, {"mode": "ready", "extra": 1}, {}):
@@ -334,17 +335,36 @@ def test_traffic_summarises_the_ledger_window(service):
             client.request("traffic", **bad)
 
 
-def test_flow_join_returns_netwatch_and_suricata_records_for_one_community_id(service, tmp_path):
+def test_api_lists_zeek_records_and_health_through_generic_source_reads(service, tmp_path):
+    from netwatch_zeek import ZeekCollector
+    from tests.test_zeek import FIXTURES, append
+
+    api, client, _, _ = service
+    append(tmp_path / "conn.log", FIXTURES["conn"])
+    collector = ZeekCollector(api.store, {"ZEEK_LOG_PATHS": [str(tmp_path / "*.log")]})
+    assert collector.poll(now=1700000010) == 1
+    api.store.record_source_health(collector.channel, collector.health(1700000010))
+    collector.close()
+    rows = client.request('sources')['data']
+    assert [(row['source'], row['event_type']) for row in rows] == [('ZEEK', 'conn')]
+    assert rows[0]['normalized']['community_id'] == FIXTURES["conn"]["community_id"]
+    health = client.request('collection-health')['data'][collector.channel]
+    assert health['source'] == 'ZEEK' and health['status'] == 'FRESH'
+
+
+def test_flow_join_returns_netwatch_suricata_and_zeek_records_for_one_community_id(service, tmp_path):
     import sqlite3
     from urllib.parse import quote
 
     from netwatch_db import EVENT_INSERT_SQL, ensure_network_event_columns, ledger_event_rows
     from netwatch_suricata import normalize_eve_record
+    from netwatch_zeek import ZeekCollector
     from tests.test_capture import ethernet, ipv4, tcp
     from tests.test_community_id import ledger_row
+    from tests.test_zeek import FIXTURES, append
 
     api, client, config, _ = service
-    cid = "1:LQU9qZlK+B5F3KDmev6m5PMibrg="  # spec vector: TCP 128.232.110.120:34855 -> 66.35.250.204:80
+    cid = FIXTURES["conn"]["community_id"]
     with sqlite3.connect(config["DB_NAME"]) as conn:
         conn.execute("CREATE TABLE network_events (uuid TEXT PRIMARY KEY, timestamp REAL, mac_src TEXT, "
                      "mac_dst TEXT, src_ip TEXT, dst_ip TEXT, protocol TEXT, port INTEGER, tcp_flags TEXT, "
@@ -359,12 +379,16 @@ def test_flow_join_returns_netwatch_and_suricata_records_for_one_community_id(se
                   "dest_ip": "66.35.250.204", "dest_port": 80, "proto": "TCP", "community_id": community_id}
         api.store.accept_source_record("SURICATA:test", {"offset": event_id}, normalize_eve_record(
             native, event_id=event_id, sensor_id="s", reference={}, received_at=time.time()), native)
+    append(tmp_path / "conn.log", FIXTURES["conn"], FIXTURES["dns"])
+    collector = ZeekCollector(api.store, {"ZEEK_LOG_PATHS": [str(tmp_path / "*.log")]})
+    assert collector.poll(now=1700000010) == 2
+    collector.close()
 
     data = client.request("flows/" + quote(cid, safe=""))["data"]
     assert data["community_id"] == cid
     assert sorted(row["uuid"] for row in data["netwatch"]) == ["back", "out"]
     assert [row["event_id"] for row in data["suricata"]] == ["eve-1"]
-    assert set(data) == {"community_id", "limit", "netwatch", "suricata"}
+    assert [row["normalized"]["flow_id"] for row in data["zeek"]] == [FIXTURES["conn"]["uid"]]
     plan = api.store._read("EXPLAIN QUERY PLAN SELECT * FROM security_source_events "
                            "WHERE json_extract(normalized, '$.community_id')=?", (cid,))
     assert "idx_source_events_community" in str([tuple(row) for row in plan])
@@ -385,8 +409,7 @@ def test_trickling_header_client_does_not_stall_close(service):
     time.sleep(0.2)
     started = time.monotonic()
     api.close()
-    # Windows does not abort a blocked recv when the server closes: the handler waits out its 3 s timeout.
-    assert time.monotonic() - started < (1.5 if os.name != "nt" else 3.5)
+    assert time.monotonic() - started < 1.5
     sock.close()
 
 
@@ -406,22 +429,6 @@ def test_connections_past_cap_are_closed_without_threads(service, monkeypatch):
     assert threading.active_count() <= threads
     for sock in (*held, extra):
         sock.close()
-
-
-def test_windows_acl_only_system_and_administrators(tmp_path, monkeypatch):
-    secret = tmp_path / "s"
-    secret.write_bytes(bytes(32))
-    secret.chmod(0o600)
-    monkeypatch.setattr(netwatch_api, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))  # os.name itself would break pathlib
-    for aces, ok in [([("A", "SY"), ("A", "BA")], True), ([("A", "S-1-5-18"), ("A", "S-1-5-32-544")], True),
-                     ([("A", "SY"), ("A", "BU")], False), ([("A", "SY"), ("A", "S-1-5-32-545")], False),
-                     ([("D", "SY")], False), ([], False)]:
-        monkeypatch.setattr(netwatch_api, "windows_acl_principals", lambda path, aces=aces: aces)
-        if ok:
-            assert load_secret(secret) == bytes(32)
-        else:
-            with pytest.raises(ValueError, match="elevated"):
-                load_secret(secret)
 
 
 def test_hello_proof_verifies_and_leaks_nothing(service):
@@ -463,16 +470,6 @@ def test_impostor_server_never_sees_the_token():
     assert client.state == "Disconnected / stale"
 
 
-def test_windows_acl_reads_icacls_save_output_without_bom(monkeypatch, tmp_path):
-    from pathlib import Path
-
-    import netwatch_api
-    raw = "service-api.secret\r\nD:AI(A;ID;FA;;;BA)(A;ID;FA;;;SY)\r\n".encode("utf-16-le")  # Sensor1's real /save output
-    monkeypatch.setattr(netwatch_api.subprocess, "run", lambda cmd, **k: Path(cmd[3]).write_bytes(raw))
-    assert netwatch_api.windows_acl_principals(tmp_path / "s") == [("A", "BA"), ("A", "SY")]
-    netwatch_api.check_windows_acl(tmp_path / "s")
-
-
 def test_response_mode_change_leaves_a_durable_audit_row(service):
     api, client, _, _ = service
     client.request("response-mode", {"mode": "autonomous"})
@@ -497,21 +494,3 @@ def test_trickling_client_loses_its_slot_at_the_request_deadline(service, monkey
             closed = True
     assert closed and time.monotonic() - started < 2.5
     sock.close()
-
-
-def test_new_windows_secret_is_restricted_before_it_is_written(tmp_path, monkeypatch):
-    secret = tmp_path / "s"
-    sizes, removed = [], []
-
-    def icacls(cmd, **kwargs):
-        if "/inheritance:r" in cmd:
-            sizes.append(secret.stat().st_size)
-        if "/remove:g" in cmd:
-            removed.append((cmd[-1], secret.stat().st_size))
-
-    monkeypatch.setattr(netwatch_api, "os", SimpleNamespace(**{**vars(os), "name": "nt"}))
-    monkeypatch.setattr(netwatch_api.subprocess, "run", icacls)
-    monkeypatch.setattr(netwatch_api, "windows_acl_principals", lambda path: [("A", "SY"), ("A", "BA")])
-    assert len(load_secret(secret, create=True)) == 32
-    assert sizes == [0]  # the DACL was replaced while the file held no secret
-    assert removed == [("*S-1-3-4", 0)]  # and any OWNER RIGHTS ACE dropped before it was written

@@ -303,6 +303,7 @@ class ControlCaptureWorker:
             pass  # A busy store must not stop capture start; the collector thread re-records health.
         self.thread = threading.Thread(target=self._run, name="control-collector", daemon=True)
         self.thread.start()
+        threading.Thread(target=self._retain, name="control-retention", daemon=True).start()
 
     def submit(self, raw, data):
         with self.lock:
@@ -336,6 +337,41 @@ class ControlCaptureWorker:
                     "policy": {"dhcp": bool(self.collector.dhcp_servers), "ra": bool(self.collector.ra_macs),
                                "dhcpv6": bool(self.collector.dhcp6_duids)}}
 
+    def _retain(self):
+        """Control retention beside the commit thread, on its own connection: in the commit thread a cold
+        quota scan of the sensor's 2.65M control rows stalled commits for minutes and overflowed the buffer (b319)."""
+        from netwatch_security_store import DurableIncidentStore
+
+        config, own = self.collector.config, self.collector.store
+        store, totals, rest = None, None, 0.0
+        while not self.stop_event.wait(rest):  # never at stop: a quota scan spent the 3 s drain (b319)
+            rest = max(1, float(config.get("CONTROL_PRUNE_INTERVAL_SEC", 60)))
+            try:
+                # A second connection to ":memory:" would open an empty database.
+                store = store or (own if str(own.path) == ":memory:" else DurableIncidentStore(
+                    own.path, sensor_id=own.sensor_id))
+                held = store.held_sec
+                report = store.prune_control_records(
+                    max_rows=config.get("CONTROL_MAX_ROWS", 200_000),
+                    max_bytes=config.get("CONTROL_MAX_BYTES", 268_435_456),
+                    retention_days=config.get("CONTROL_RETENTION_DAYS", 7),
+                    arp_enabled=config.get("ARP_DETECTION_ENABLED", True),
+                    batch=config.get("CONTROL_PRUNE_BATCH_ROWS", 128), totals=totals,
+                )
+                with self.lock:
+                    self.retention = report
+                # A full batch leaves work behind: the next one follows on the same quota totals,
+                # after resting 3x its writer-lock hold so other writers take the shared lock.
+                totals = (report["rows"], report["payload_bytes"]) if report.get("full") else None
+                if totals:
+                    rest = max(0.1, 3 * (store.held_sec - held))
+            except Exception as exc:  # a failed pass waits the interval and rescans, never repeats every turn
+                totals = None
+                with self.lock:
+                    self.last_error = str(exc)[:1000]
+        if store is not None and store is not own:
+            store.close()
+
     def _disk_admitted(self):
         admitted, free = disk_admission(self.collector.store.path, self.disk["floor_bytes"])
         with self.lock:
@@ -346,9 +382,6 @@ class ControlCaptureWorker:
         startup_gap = self.startup_gap
         jobs = []
         last_health = 0.0
-        last_retention = float("-inf")  # not 0.0: monotonic() is host uptime, < the interval on a fresh runner
-        retention_totals = None
-        backlog_after = 0.0  # backlog batches rest between turns so other writers get the lock
         while (not self.stop_event.is_set() or jobs or not self.pending.empty() or startup_gap
                or self.pending_drops or self.disk_drops):
             if time.monotonic() >= self.deadline:
@@ -372,30 +405,6 @@ class ControlCaptureWorker:
                                        "these observed frames were not committed", refused)
                     with self.lock:
                         self.disk_drops -= refused
-                # Frames first: a backlog batch every turn starved commits and overflowed the buffer.
-                if ((retention_totals is not None and self.pending.empty() and time.monotonic() >= backlog_after)
-                        or time.monotonic() - last_retention
-                        >= max(1, float(self.collector.config.get("CONTROL_PRUNE_INTERVAL_SEC", 60)))):
-                    batch = self.collector.config.get("CONTROL_PRUNE_BATCH_ROWS", 128)
-                    # Taken before the call: a pass that raises waits the interval instead of
-                    # repeating every turn and blocking commits (the sensor's damaged store, 2026-10-11).
-                    totals, retention_totals = retention_totals, None
-                    last_retention = time.monotonic()
-                    report = self.collector.store.prune_control_records(
-                        max_rows=self.collector.config.get("CONTROL_MAX_ROWS", 200_000),
-                        max_bytes=self.collector.config.get("CONTROL_MAX_BYTES", 268_435_456),
-                        retention_days=self.collector.config.get("CONTROL_RETENTION_DAYS", 7),
-                        arp_enabled=self.collector.config.get("ARP_DETECTION_ENABLED", True),
-                        batch=batch, totals=totals,
-                    )
-                    with self.lock:
-                        self.retention = report
-                    # A full batch can leave work behind: take the next one next turn on the same
-                    # quota totals. One batch a minute fell behind the sensor's ~19k control rows/hour.
-                    retention_totals = (report["rows"], report["payload_bytes"]) if report["pruned"] >= batch else None
-                    # Rest 3x the batch's own time: back-to-back batches held the shared writer lock
-                    # nearly always on the sensor and starved every other writer past its busy timeout.
-                    backlog_after = time.monotonic() + 3 * (time.monotonic() - last_retention)
                 if time.monotonic() - last_health >= self.heartbeat_sec:
                     self.collector.store.record_source_health(self.collector.source_key, self.health())
                     last_health = time.monotonic()

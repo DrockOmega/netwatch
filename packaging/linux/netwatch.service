@@ -18,6 +18,7 @@ After=network-online.target
 Type=simple
 User=netwatch
 Group=netwatch
+SupplementaryGroups=suricata
 KillMode=mixed
 # Above RUNTIME_STOP_GRACE_SEC (60) so the ordered drain, not systemd, decides a stop's outcome.
 TimeoutStopSec=90

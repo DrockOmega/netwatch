@@ -7,7 +7,6 @@ host are NOT), poison is re-asserted, release heals, and TTL expiry lifts.
 """
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -301,20 +300,10 @@ def test_cli_hold_keeps_reasserting_until_expiry(tmp_path, monkeypatch):
 
 # --- real effector: frames (dry run, _send stubbed) and OS-output parsers ------------------
 
-ARP_A_WINDOWS = """
-Interface: 192.168.1.20 --- 0x7
-  Internet Address      Physical Address      Type
-  192.168.1.1           aa-bb-cc-dd-ee-01     dynamic
-  192.168.1.50          AA-BB-CC-DD-EE-50     dynamic
-  192.168.1.255         ff-ff-ff-ff-ff-ff     static
-"""
-ROUTE_PRINT_WINDOWS = """
-IPv4 Route Table
-===========================================================================
-Active Routes:
-Network Destination        Netmask          Gateway       Interface  Metric
-          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.20     25
-        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+PROC_ARP = """IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:01     *        eth0
+192.168.1.50     0x1         0x2         AA:BB:CC:DD:EE:50     *        eth0
+192.168.1.77     0x1         0x0         00:00:00:00:00:00     *        eth0
 """
 
 
@@ -362,28 +351,15 @@ def test_gateway_poisoned_failsafe_reads_the_real_arp_cache(monkeypatch):
     assert eff.is_gateway_poisoned("10.0.0.1") and not eff.is_gateway_poisoned("10.0.0.2")
 
 
-def test_parse_arp_cache_reads_windows_arp_a(monkeypatch):
+def test_parse_arp_cache_reads_proc_net_arp(monkeypatch, tmp_path):
     import netwatch_quarantine as nq
 
-    monkeypatch.setattr(nq.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=ARP_A_WINDOWS))
-    assert nq._parse_arp_cache() == {"192.168.1.1": "aa:bb:cc:dd:ee:01", "192.168.1.50": "aa:bb:cc:dd:ee:50",
-                                     "192.168.1.255": "ff:ff:ff:ff:ff:ff"}
-
-    def missing(*_a, **_k):
-        raise FileNotFoundError("arp")
-
-    monkeypatch.setattr(nq.subprocess, "run", missing)
+    table = tmp_path / "arp"
+    table.write_text(PROC_ARP)
+    monkeypatch.setattr(nq, "PROC_NET_ARP", str(table))
+    assert nq._parse_arp_cache() == {"192.168.1.1": "aa:bb:cc:dd:ee:01", "192.168.1.50": "aa:bb:cc:dd:ee:50"}
+    monkeypatch.setattr(nq, "PROC_NET_ARP", str(tmp_path / "missing"))
     assert nq._parse_arp_cache() == {}
-
-
-def test_detect_default_gateway_parses_windows_route_print(monkeypatch):
-    import netwatch_config as nc
-
-    monkeypatch.setattr(nc.os, "name", "nt")
-    monkeypatch.setattr(nc.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout=ROUTE_PRINT_WINDOWS))
-    assert nc.detect_default_gateway() == "192.168.1.1"
-    monkeypatch.setattr(nc.subprocess, "run", lambda *_a, **_k: SimpleNamespace(stdout="no routes"))
-    assert nc.detect_default_gateway() == ""
 
 
 def test_detect_default_gateway_reads_proc_net_route_lowest_metric(monkeypatch, tmp_path):
@@ -395,31 +371,10 @@ def test_detect_default_gateway_reads_proc_net_route_lowest_metric(monkeypatch, 
         "eth0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"   # 192.168.1.1, metric 600
         "wlan0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"  # 10.0.0.1, metric 100
         "eth0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n")
-    monkeypatch.setattr(nc.os, "name", "posix")
     monkeypatch.setattr(nc, "PROC_NET_ROUTE", str(table))
     assert nc.detect_default_gateway() == "10.0.0.1"
     monkeypatch.setattr(nc, "PROC_NET_ROUTE", str(tmp_path / "missing"))
     assert nc.detect_default_gateway() == ""
-
-
-def test_failed_route_and_arp_commands_are_not_parsed(monkeypatch):
-    import subprocess
-
-    import netwatch_config as nc
-    import netwatch_quarantine as nq
-
-    def failing(stdout):
-        def run(args, **kwargs):  # exits non-zero yet printed something: only check=True notices
-            if kwargs.get("check"):
-                raise subprocess.CalledProcessError(1, args, output=stdout)
-            return SimpleNamespace(stdout=stdout, returncode=1)
-        return run
-
-    monkeypatch.setattr(nc.os, "name", "nt")
-    monkeypatch.setattr(nc.subprocess, "run", failing(ROUTE_PRINT_WINDOWS))
-    assert nc.detect_default_gateway() == ""
-    monkeypatch.setattr(nq.subprocess, "run", failing(ARP_A_WINDOWS))
-    assert nq._parse_arp_cache() == {}
 
 
 def test_pending_queue_is_capped():

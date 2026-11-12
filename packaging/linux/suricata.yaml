@@ -1,0 +1,302 @@
+%YAML 1.1
+---
+# NetWatch sensor Suricata 8.0 config (AF_PACKET, IDS only; threading/affinity left to Suricata,
+# one rule file from suricata-update).
+# Install: /etc/netwatch/suricata/suricata.yaml. The capture interface is set by netwatch-suricata.service
+# (--af-packet=$NW_IFACE from /etc/netwatch/sensor.env); the interface entry below is only its default.
+suricata-version: "8.0"
+
+vars:
+  address-groups:
+    HOME_NET: "[10.0.0.0/24,2001:db8:0:1::/64]"   # your LAN /24 and IPv6 /64s
+    EXTERNAL_NET: "!$HOME_NET"
+    # Tailscale DERP relays (TAILSCALE_DERP): netwatch-suricata-update rewrites this file daily from
+    # https://login.tailscale.com/derpmap/default (b791); seed: packaging/suricata/tailscale-derp.yaml.
+    include: /var/lib/suricata/tailscale-derp.yaml
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    DC_SERVERS: "$HOME_NET"
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "80"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: 21
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+    SIP_PORTS: "[5060, 5061]"
+
+default-log-dir: /var/lib/suricata
+
+stats:
+  enabled: yes
+  interval: 30
+
+outputs:
+  - fast:
+      enabled: no
+  # NetWatch's EveCollector reads eve.json* (globbed); one dated file per UTC day, never a fixed name.
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json.%Y-%m-%d
+      rotate-interval: 1d
+      pcap-file: false
+      community-id: false
+      types:
+        - alert:
+            tagged-packets: no
+        # Anomaly records are stream noise on a mirror port; NetWatch accepts them. Flip to yes to add.
+        - anomaly:
+            enabled: no
+        - http:
+            extended: yes
+        - dns
+        - tls:
+            extended: yes
+        - stats:
+            totals: yes
+            threads: no
+            deltas: no
+        # flow off (2026-10-18): duplicated Zeek conn and used half the SURICATA row cap
+        # - flow
+
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes
+    - file:
+        enabled: yes
+        level: info
+        filename: suricata.log
+    - syslog:
+        enabled: no
+
+af-packet:
+  - interface: eth0
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    tpacket-v3: yes
+    use-mmap: yes
+    ring-size: 8192
+    checksum-checks: no
+  # The unit passes --af-packet=$NW_IFACE (e.g. enx001122334455), which matches no named entry, so this
+  # one carries the capture tuning. 2026-10-16: the default 2048-frame ring dropped 1.2-2.6% in bursts
+  # (kernel_drops; NIC rx dropped/missed 0).
+  - interface: default
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    tpacket-v3: yes
+    use-mmap: yes
+    ring-size: 32768
+    block-size: 1048576
+    checksum-checks: no
+
+pcap-file:
+  checksum-checks: auto
+
+app-layer:
+  protocols:
+    telnet: {enabled: yes}
+    rfb:
+      enabled: yes
+      detection-ports:
+        dp: 5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909
+    mqtt: {enabled: yes}
+    krb5: {enabled: yes}
+    bittorrent-dht: {enabled: yes}
+    snmp: {enabled: yes}
+    ike: {enabled: yes}
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+    pgsql:
+      enabled: no
+      stream-depth: 0
+    dcerpc: {enabled: yes}
+    ftp: {enabled: yes}
+    ssh: {enabled: yes}
+    doh2: {enabled: yes}
+    http2: {enabled: yes}
+    smtp:
+      enabled: yes
+      raw-extraction: no
+      mime:
+        decode-mime: yes
+        decode-base64: yes
+        decode-quoted-printable: yes
+        header-value-depth: 2000
+        extract-urls: yes
+        body-md5: no
+      inspected-tracker:
+        content-limit: 100000
+        content-inspect-min-size: 32768
+        content-inspect-window: 4096
+    imap: {enabled: detection-only}
+    pop3:
+      enabled: yes
+      detection-ports:
+        dp: 110
+      stream-depth: 0
+    smb:
+      enabled: yes
+      detection-ports:
+        dp: 139, 445
+    nfs: {enabled: yes}
+    tftp: {enabled: yes}
+    dns:
+      tcp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+      udp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+    http:
+      enabled: yes
+      libhtp:
+        default-config:
+          personality: IDS
+          request-body-limit: 100 KiB
+          response-body-limit: 100 KiB
+          request-body-minimal-inspect-size: 32 KiB
+          request-body-inspect-window: 4 KiB
+          response-body-minimal-inspect-size: 40 KiB
+          response-body-inspect-window: 16 KiB
+          response-body-decompress-layer-limit: 2
+          http-body-inline: auto
+          double-decode-path: no
+          double-decode-query: no
+    modbus: {enabled: no}
+    dnp3: {enabled: no}
+    enip: {enabled: no}
+    ntp: {enabled: yes}
+    quic: {enabled: yes}
+    dhcp: {enabled: yes}
+    ldap:
+      tcp:
+        enabled: yes
+        detection-ports:
+          dp: 389, 3268
+      udp:
+        enabled: yes
+        detection-ports:
+          dp: 389, 3268
+    mdns: {enabled: yes}
+
+asn1-max-frames: 256
+
+security:
+  limit-noproc: true
+
+host-mode: auto
+unix-command:
+  enabled: no
+legacy:
+  uricontent: enabled
+exception-policy: auto
+pcre:
+  match-limit: 3500
+  match-limit-recursion: 1500
+
+# Stream reassembly uses Suricata's default (bsd) host policy: the LAN is mostly Linux, iOS and Android.
+
+defrag:
+  memcap: 32 MiB
+  hash-size: 65536
+  trackers: 65535
+  max-frags: 65535
+  prealloc: yes
+  timeout: 60
+
+flow:
+  memcap: 128 MiB
+  hash-size: 65536
+  prealloc: 10000
+  emergency-recovery: 30
+
+vlan:
+  use-for-tracking: true
+livedev:
+  use-for-tracking: true
+
+flow-timeouts:
+  default: {new: 30, established: 300, closed: 0, bypassed: 100, emergency-new: 10, emergency-established: 100, emergency-closed: 0, emergency-bypassed: 50}
+  tcp: {new: 60, established: 600, closed: 60, bypassed: 100, emergency-new: 5, emergency-established: 100, emergency-closed: 10, emergency-bypassed: 50}
+  udp: {new: 30, established: 300, bypassed: 100, emergency-new: 10, emergency-established: 100, emergency-bypassed: 50}
+  icmp: {new: 30, established: 300, bypassed: 100, emergency-new: 10, emergency-established: 100, emergency-bypassed: 50}
+
+stream:
+  memcap: 64 MiB
+  checksum-validation: yes
+  inline: no
+  reassembly:
+    urgent:
+      policy: oob
+      oob-limit-policy: drop
+    memcap: 256 MiB
+    depth: 1 MiB
+    toserver-chunk-size: 2560
+    toclient-chunk-size: 2560
+    randomize-chunk-size: yes
+
+host:
+  hash-size: 4096
+  prealloc: 1000
+  memcap: 32 MiB
+
+decoder:
+  teredo: {enabled: true, ports: $TEREDO_PORTS}
+  vxlan: {enabled: true, ports: $VXLAN_PORTS}
+  geneve: {enabled: true, ports: $GENEVE_PORTS}
+  recursion-level:
+    use-for-tracking: true
+
+detect:
+  profile: medium
+  custom-values:
+    toclient-groups: 3
+    toserver-groups: 25
+  sgh-mpm-context: auto
+  sgh-mpm-caching: yes
+  sgh-mpm-caching-path: /var/lib/suricata/cache/sgh/
+  prefilter:
+    default: mpm
+  thresholds:
+    hash-size: 16384
+    memcap: 16 MiB
+
+mpm-algo: auto
+spm-algo: auto
+
+threading:
+  set-cpu-affinity: no
+  detect-thread-ratio: 0.2
+
+# suricata-update writes the merged ET Open set here (netwatch-suricata-update.sh).
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+
+classification-file: /var/lib/suricata/rules/classification.config
+reference-config-file: /etc/suricata/reference.config
+threshold-file: /etc/netwatch/suricata/threshold.config

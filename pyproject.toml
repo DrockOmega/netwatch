@@ -1,7 +1,7 @@
 [project]
 name = "netwatch"
 version = "0.1.0"
-description = "A Windows desktop home-network IDS/IPS platform with live capture, incident correlation, and reversible response."
+description = "A Linux home-network IDS/IPS platform with live capture, incident correlation, and reversible response."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }

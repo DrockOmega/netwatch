@@ -1,0 +1,9 @@
+[Unit]
+Description=Delete Suricata EVE files untouched for 3 days (daily 04:00)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

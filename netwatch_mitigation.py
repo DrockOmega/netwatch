@@ -6,24 +6,22 @@ This is the "and mitigation" half of the product. It is built defensively:
   capacity cap, and the auto-vs-approve gate are decided without any side effects
   (``Mitigator.evaluate``). The effector is only touched when a decision is
   actually applied.
-- **The effector is injectable.** ``WindowsFirewall`` wraps ``netsh advfirewall``;
-  tests pass a recording fake so they never shell out. A ``dry_run`` effector
-  logs the exact commands without executing them.
+- **The effector is injectable.** The default ``RecordingFirewall`` changes no host
+  firewall: it records each block and unblock it is asked for, so policy, ledger and
+  expiry run end to end with nothing enforced.
 - **Safe by default.** Local/multicast/broadcast ranges are never blockable, an
   explicit allowlist is honored, every block carries an auto-expiry, and manual
   mode requires an explicit ``approve`` before anything happens.
 - **Durable.** The active-block ledger is persisted to JSON so blocks survive a
   restart and their expiries are still honored (and cleaned up) on the next boot.
 
-Windows-only at the effector layer; the policy layer is platform-agnostic and is
-what the test suite exercises.
+No host-firewall effector ships; the policy layer is what the test suite exercises.
 """
 
 import ipaddress
 import json
 import logging
 import os
-import subprocess
 import time
 from collections import deque
 
@@ -105,56 +103,19 @@ class FirewallError(RuntimeError):
     pass
 
 
-class WindowsFirewall:
-    """Effector that creates/deletes ``netsh advfirewall`` block rules.
+class RecordingFirewall:
+    """Effector that records each block and unblock and changes nothing on the host."""
 
-    Creates a paired inbound + outbound block for the remote IP under one rule
-    name; deleting by name removes both. With ``dry_run=True`` it records the
-    commands it *would* run instead of executing them (the default, on purpose).
-    """
+    dry_run = True  # nothing is enforced: its ledger entries never bind a live engine, and the UI says DRY RUN
 
-    def __init__(self, dry_run=True):
-        self.dry_run = dry_run
-        self.commands = deque(maxlen=256)  # recent issued (or simulated) commands; in memory only, the ledger is the record
-
-    def _run(self, args):
-        self.commands.append(args)
-        if self.dry_run:
-            return
-        try:
-            subprocess.run(args, check=True, capture_output=True, text=True, timeout=15)
-        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as e:
-            raise FirewallError(f"{' '.join(args)} -> {e} {getattr(e, 'stdout', '') or ''}".rstrip()) from e
+    def __init__(self):
+        self.commands = deque(maxlen=256)  # recent requests; in memory only, the ledger is the record
 
     def block(self, ip, rule_name):
-        self._run([
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f"name={rule_name}", "dir=in", "action=block", f"remoteip={ip}",
-        ])
-        try:
-            self._run([
-                "netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={rule_name}", "dir=out", "action=block", f"remoteip={ip}",
-            ])
-        except FirewallError:
-            try:
-                self.unblock(rule_name)
-            except FirewallError as rollback_error:
-                logging.getLogger("netwatch.ui").warning(
-                    "rollback of half-installed rule %r failed: %s", rule_name, rollback_error)
-            raise
+        self.commands.append(("block", ip, rule_name))
 
     def unblock(self, rule_name):
-        try:
-            self._run([
-                "netsh", "advfirewall", "firewall", "delete", "rule",
-                f"name={rule_name}",
-            ])
-        except FirewallError as e:
-            # An absent rule is already unblocked; otherwise reconcile retries the entry forever.
-            # shortcut: matches English netsh output only; key on `show rule` if a localized host appears.
-            if "No rules match" not in str(e):
-                raise
+        self.commands.append(("unblock", rule_name))
 
 
 class Mitigator:
@@ -176,7 +137,7 @@ class Mitigator:
         allowlist_networks=None,
         ledger_path=None,
     ):
-        self.effector = effector if effector is not None else WindowsFirewall(dry_run=True)
+        self.effector = effector if effector is not None else RecordingFirewall()
         self.auto = auto
         self.block_ttl_sec = block_ttl_sec
         self.max_active = max_active

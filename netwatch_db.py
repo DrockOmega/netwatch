@@ -1,5 +1,6 @@
 """SQLite ledger persistence and bounded maintenance."""
 
+import functools
 import json
 import operator
 import os
@@ -111,6 +112,20 @@ def ledger_event_rows(rows):
     return [(*row, row_community_id(row)) for row in rows]
 
 
+@functools.lru_cache(maxsize=1024)
+def _merged_str_flags(left, right):
+    flags = f"{left}{right}"
+    return "".join(flag for flag in _TCP_FLAG_ORDER if flag in flags) or left or right
+
+
+def _merged_flags(left, right):
+    """Union of two rows' TCP flags in canonical order (memoised: a flow repeats the same few pairs)."""
+    if type(left) is str and type(right) is str:
+        return _merged_str_flags(left, right)
+    flags = f"{left}{right}"
+    return "".join(flag for flag in _TCP_FLAG_ORDER if flag in flags) or left or right
+
+
 def compact_event_rows(rows):
     """Collapse packet rows into one-second directional flow summaries.
 
@@ -119,8 +134,7 @@ def compact_event_rows(rows):
     IPC serialization per frame.
     """
     compacted = {}
-    for raw in rows or ():
-        row = list(raw)
+    for row in rows or ():  # a sequence; copied to a list only when it opens a summary
         if len(row) != 20:
             raise ValueError(f"network event row has {len(row)} fields; expected 20")
         packet_count = max(1, int(row[13]))
@@ -128,13 +142,11 @@ def compact_event_rows(rows):
         key = (second, *row[2:8], row[11], row[12], *row[14:])
         current = compacted.get(key)
         if current is None:
-            row[1] = float(second)
-            row[13] = packet_count
-            compacted[key] = row
+            current = compacted[key] = list(row)
+            current[1] = float(second)
+            current[13] = packet_count
             continue
-        flags = f"{current[8]}{row[8]}"
-        merged_flags = "".join(flag for flag in _TCP_FLAG_ORDER if flag in flags)
-        current[8] = merged_flags or current[8] or row[8]
+        current[8] = _merged_flags(current[8], row[8])
         current[10] = int(current[10]) + int(row[10])
         current[13] = int(current[13]) + packet_count
     return [tuple(row) for row in compacted.values()]
@@ -391,13 +403,14 @@ def db_persistence_worker(db_queue, status_queue, config, shutdown_event=None):
             # A fixed small batch keeps the shared security writer lock short.
             removed, more = store.prune_metadata(
                 retention_days=float(config.get("METADATA_RETENTION_DAYS", 30) or 0),
-                case_retention_days=float(config.get("CASE_RETENTION_DAYS", 365) or 0),
+                case_retention_days=float(config.get("CASE_RETENTION_DAYS", 30) or 0),
                 batch_rows=1000, max_batches=1,
                 native_retention_days=float(config.get("NATIVE_METADATA_RETENTION_DAYS", 1) or 0), now=now)
             metadata_removed += removed
+            # Recorded every batch, like native retention: a pass that never ended left the row 43 h stale (b551).
+            store.record_source_health("RETENTION:METADATA", {
+                "status": "RUNNING", "removed_last_pass": metadata_removed, "pending": more}, now)
             if not more:
-                store.record_source_health("RETENTION:METADATA", {
-                    "status": "RUNNING", "removed_last_pass": metadata_removed}, now)
                 if metadata_removed:
                     log.info("metadata retention: removed %d row(s)", metadata_removed)
                 metadata_removed = 0
@@ -407,13 +420,18 @@ def db_persistence_worker(db_queue, status_queue, config, shutdown_event=None):
             return False
 
     native_totals = {}
+    native_rested = {}  # source -> monotonic end of its last pass
 
     def prune_native(store, now):
-        """One bounded SURICATA payload batch per turn (same pins as CONTROL)."""
+        """One bounded SURICATA/ZEEK payload batch per source per turn (same pins as CONTROL)."""
         from netwatch_security_store import retention_status
 
         more = False
-        for source in ("SURICATA",):
+        for source in ("SURICATA", "ZEEK", "WAZUH"):
+            # A finished source waits a prune interval: rescanning SURICATA each time it touched its cap
+            # spent a 134 s quota scan every few turns while ZEEK's backlog waited behind it (b534).
+            if time.monotonic() - native_rested.get(source, -prune_interval) < prune_interval:
+                continue
             try:
                 report = store.prune_native_records(
                     source, max_rows=config.get("NATIVE_MAX_ROWS", 1_000_000),
@@ -429,11 +447,12 @@ def db_persistence_worker(db_queue, status_queue, config, shutdown_event=None):
             store.record_source_health(f"RETENTION:NATIVE:{source}", {
                 "status": retention_status(report, config.get("NATIVE_MAX_ROWS", 1_000_000),
                                            config.get("NATIVE_MAX_BYTES", 1_073_741_824)), **report}, now)
-            if report["pruned"] >= NATIVE_PRUNE_BATCH:  # Only a full batch can leave work behind.
+            if report["full"]:  # A full batch or a cut over-quota walk leaves work behind.
                 native_totals[source] = (report["rows"], report["payload_bytes"])
                 more = True
                 continue
             native_totals.pop(source, None)
+            native_rested[source] = time.monotonic()
         return more
 
     def prune_assets(store, now):
@@ -466,13 +485,14 @@ def db_persistence_worker(db_queue, status_queue, config, shutdown_event=None):
                         continue
                     store = security_store_from_config(config)
                 while not retention_stop.is_set():
-                    started = time.monotonic()
+                    held = store.held_sec
                     if not (prune_metadata(store, time.time()) | prune_native(store, time.time())
                             | prune_assets(store, time.time())):
                         break
-                    # Rest 3x the batch's own time so other writers take the shared lock between
-                    # batches: a fixed 0.1 s gap left it held nearly always on the sensor (2026-10-11).
-                    retention_stop.wait(max(0.1, 3 * (time.monotonic() - started)))
+                    # Rest 3x the batch's writer-lock hold so other writers take the shared lock between
+                    # batches: a fixed 0.1 s gap left it held nearly always on the sensor (2026-10-11). Wall
+                    # time also counted the lock-free quota scan, so a 134 s scan rested 10 min (b534).
+                    retention_stop.wait(max(0.1, 3 * (store.held_sec - held)))
             except Exception as exc:  # never end retention for good; the next pass retries
                 log.error("security retention deferred: %s: %s", type(exc).__name__, exc)
         if store is not None:

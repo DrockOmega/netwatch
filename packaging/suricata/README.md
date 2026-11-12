@@ -1,7 +1,6 @@
 # Suricata tuning for the mirror-port sensor VM (2026-10-08)
 
-Historical: the `netwatch-sensor` VM was retired on 2026-10-09; a native Suricata for Windows install is now the sensor.
-The tuning below is kept as reference for a future Linux sensor.
+The sensor's Suricata (`netwatch-suricata.service`, config `/etc/netwatch/suricata/`) is the sensor; `threshold.config`, `disable.conf` and `local.rules` here are its source (the update timer merges the last two into the ET Open set).
 
 Applied on `netwatch-sensor`; backups sit next to each file with a `.bak-2026-10-08` suffix.
 

@@ -111,7 +111,7 @@ def test_persistence_worker_runs_metadata_retention_and_records_health(tmp_path,
     original = DurableIncidentStore.record_source_health
 
     # Read the first pass's own health row: retention keeps passing until the worker sees
-    # shutdown (one loop turn, slower on Windows), and a later empty pass records 0.
+    # shutdown (one loop turn), and a later empty pass records 0.
     def health_then_stop(self, source_key, body, now=None):
         original(self, source_key, body, now)
         if source_key == "RETENTION:METADATA":
@@ -123,7 +123,7 @@ def test_persistence_worker_runs_metadata_retention_and_records_health(tmp_path,
         "DB_NAME": str(ledger), "SPOOL_PATH": str(tmp_path / "spool.db"), "DB_PRUNE_INTERVAL_SEC": 0,
         "LOG_DIR": "", "LOG_TO_CONSOLE": False}, shutdown))
     worker.start()
-    worker.join(timeout=60)  # hosted Windows runners stall well past 10s under load
+    worker.join(timeout=60)  # a loaded runner can stall well past 10s
     assert not worker.is_alive()
     store = DurableIncidentStore(f"{ledger}.security.db")
     assert store.get(case_id) is None

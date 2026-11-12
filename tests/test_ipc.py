@@ -1,37 +1,19 @@
 """Unit tests for the cross-process IPC message contract."""
 
-import os
 import queue
 import threading
-import uuid
-
-import pytest
 
 from netwatch_core import (
     MESSAGE_PAYLOAD_KEYSET,
-    acquire_single_instance_mutex,
     is_message_payload,
     make_db_batch_message,
     make_message,
     newest_render_data,
     newest_render_events,
-    release_single_instance_mutex,
     start_parent_watchdog,
     try_put_drop_oldest,
     try_put_drop_oldest_with_eviction,
 )
-
-
-@pytest.mark.skipif(os.name != "nt", reason="named mutex is Windows-only")
-def test_single_instance_mutex_rejects_a_second_owner():
-    name = f"Local\\NetWatch.Test.{uuid.uuid4()}"
-    first = acquire_single_instance_mutex(name)
-    try:
-        second = acquire_single_instance_mutex(name)
-        assert first is not None
-        assert second is None
-    finally:
-        release_single_instance_mutex(first)
 
 
 class _DeadParent:

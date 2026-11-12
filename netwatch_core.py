@@ -24,7 +24,6 @@ import shutil
 import socket
 import struct
 import threading
-import time
 import uuid
 import zlib
 
@@ -42,39 +41,6 @@ def disk_admission(path, min_free_bytes=DISK_MIN_FREE_BYTES):
     except OSError:
         return True, None
     return free >= max(0, int(min_free_bytes or 0)), free
-
-
-def acquire_single_instance_mutex(name):
-    """Acquire a process-lifetime named mutex on Windows; return ``None`` if held."""
-    if os.name != "nt":
-        return object()
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    kernel32.CloseHandle.restype = ctypes.c_bool
-    handle = kernel32.CreateMutexW(None, False, str(name))
-    if not handle:
-        raise ctypes.WinError(ctypes.get_last_error())
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        kernel32.CloseHandle(handle)
-        return None
-    return handle
-
-
-def release_single_instance_mutex(handle):
-    """Release a mutex returned by :func:`acquire_single_instance_mutex`."""
-    if handle is None or os.name != "nt":
-        return
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    kernel32.CloseHandle.restype = ctypes.c_bool
-    if not kernel32.CloseHandle(handle):
-        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def start_parent_watchdog(shutdown_event, *, parent=None, interval_sec=1.0):
@@ -553,20 +519,28 @@ def _roll_window(buckets, state, current_time, window, nbuckets):
     return int(b % nbuckets)
 
 
-def analyze_udp_flood(arena_row, current_time, config, src):
+def analyze_udp_flood(arena_row, current_time, config, src, packets=1.0):
     """Sliding-window UDP packet-rate detector. Returns an alert string when a
     single source exceeds ``UDP_FLOOD_THRESHOLD`` packets inside
-    ``UDP_FLOOD_WINDOW_SEC``, else ``None``."""
+    ``UDP_FLOOD_WINDOW_SEC``, else ``None``. ``packets`` > 1 is a Zeek conn delta."""
     buckets, state = arena_row['udp_buckets'], arena_row['udp_state']
     idx = _roll_window(buckets, state, current_time, config["UDP_FLOOD_WINDOW_SEC"], len(buckets))
-    buckets[idx] += 1.0
-    state[1] += 1.0
+    buckets[idx] += packets
+    state[1] += packets
 
     if state[1] > config["UDP_FLOOD_THRESHOLD"]:
         buckets[:] = 0.0
         state[1] = 0.0
         return f"UDP FLOOD ALERT: {src} blasted >{config['UDP_FLOOD_THRESHOLD']} pkts"
     return None
+
+
+def bulk_shed_flow(protocol, sport, dport):
+    """True for a flow netwatch_config.bulk_shed_filter sheds payload of: TCP except DNS, and UDP/443 (QUIC).
+    With BULK_SHED_BYTES set, such a flow's volume comes only from Zeek conn records, never from packets."""
+    if protocol == "TCP":
+        return sport != 53 and dport != 53
+    return protocol == "UDP" and (sport == 443 or dport == 443)
 
 
 def analyze_port_sweep(arena_row, current_time, config, src, dport, sport=0, tcp_flags=None):
@@ -647,15 +621,8 @@ def write_json_atomic(path, payload):
             json.dump(payload, f, indent=2)
             f.flush()
             os.fsync(f.fileno())  # else a power cut after the rename can leave an empty ledger
-        for delay in (0.05, 0.1, 0.2, None):
-            try:
-                os.replace(tmp_path, path)
-                return True
-            except PermissionError:
-                # Windows refuses the rename while a reader (CLI, backup, scanner) holds the target open.
-                if delay is None:
-                    raise
-                time.sleep(delay)
+        os.replace(tmp_path, path)
+        return True
     except OSError:
         return False
 

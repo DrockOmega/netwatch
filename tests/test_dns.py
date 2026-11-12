@@ -64,6 +64,12 @@ def test_reverse_dns_skipped():
     assert a.hosts["10.0.0.5"]["queries"] == 1  # counted, just not scored
 
 
+def test_single_label_hostname_skipped():
+    # A Windows PC name looked up over LLMNR fired DGA 506 times in a day (2026-10-22).
+    a = DnsAnalyzer(dga_threshold=0.7)
+    assert a.observe("fe80::1", "ff02::1:3", "desktop-0000000", qr=0, rcode=0, qtype=1, now=1.0) == []
+
+
 # --- tunneling -------------------------------------------------------------
 
 
@@ -84,8 +90,8 @@ def test_tunnel_ignore_suffixes_skip_only_the_tunnel_check():
                     qr=0, rcode=0, qtype=1, now=1.0)
     assert any(f["kind"] == DNS_TUNNEL for f in out)
     # NXDOMAIN counting still sees an ignored suffix.
-    for t in (2.0, 3.0):
-        out = a.observe("8.8.8.8", "10.0.0.5", "x.elb.amazonaws.com", qr=1, rcode=3, qtype=1, now=t)
+    for t, sub in ((2.0, "x"), (3.0, "y")):
+        out = a.observe("8.8.8.8", "10.0.0.5", f"{sub}.elb.amazonaws.com", qr=1, rcode=3, qtype=1, now=t)
     assert any(f["kind"] == NXDOMAIN_BURST for f in out)
 
 
@@ -123,8 +129,19 @@ def test_nxdomain_burst():
     fired = []
     for i in range(12):
         fired += a.observe("8.8.8.8", "10.0.0.5", f"gen{i}.bad.com", qr=1, rcode=3, qtype=1, now=float(i))
-    assert any(f["kind"] == NXDOMAIN_BURST for f in fired)
+    burst = next(f for f in fired if f["kind"] == NXDOMAIN_BURST)
+    assert burst["message"].endswith(": gen10.bad.com, gen9.bad.com, gen8.bad.com")
     assert a.hosts["10.0.0.5"]["nxdomain"] == 12
+
+
+def test_nxdomain_service_discovery_probes_not_counted():
+    # apt-daily refreshing ~30 repos asks _https._tcp.<repo> SRV for each; most answer NXDOMAIN.
+    a = DnsAnalyzer(nxdomain_window_sec=30, nxdomain_threshold=10)
+    fired = []
+    for i in range(30):
+        fired += a.observe("8.8.8.8", "10.0.0.5", f"_https._tcp.repo{i}.example.org", qr=1, rcode=3, qtype=33, now=float(i) / 10)
+    assert not any(f["kind"] == NXDOMAIN_BURST for f in fired)
+    assert a.hosts.get("10.0.0.5", {}).get("nxdomain", 0) == 0
 
 
 def test_nxdomain_below_threshold_quiet():
@@ -155,17 +172,26 @@ def test_nxdomain_ignore_suffix_suppresses_service_discovery_noise():
 def test_nxdomain_window_bounded():
     a = DnsAnalyzer(nxdomain_window_sec=30, nxdomain_threshold=10)
     fired = []
-    for _ in range(10_000):
-        fired += a.observe("8.8.8.8", "10.0.0.5", "x.bad.com", qr=1, rcode=3, qtype=1, now=1.0)
+    for i in range(10_000):
+        fired += a.observe("8.8.8.8", "10.0.0.5", f"gen{i}.bad.com", qr=1, rcode=3, qtype=1, now=1.0)
     assert len(a._nx_windows["10.0.0.5"]) <= 11
     assert sum(f["kind"] == NXDOMAIN_BURST for f in fired) == 1
+
+
+def test_nxdomain_one_name_retried_stays_quiet():
+    # Android retrying one dead ad host (A+AAAA, v4+v6) is not a DGA (b252).
+    a = DnsAnalyzer(nxdomain_window_sec=30, nxdomain_threshold=10)
+    fired = []
+    for _ in range(32):
+        fired += a.observe("8.8.8.8", "10.0.0.5", "static.aroa.io", qr=1, rcode=3, qtype=1, now=1.0)
+    assert not any(f["kind"] == NXDOMAIN_BURST for f in fired)
 
 
 def test_nxdomain_window_expiry():
     a = DnsAnalyzer(nxdomain_window_sec=10, nxdomain_threshold=5)
     # spread sightings 100s apart -> window never accumulates -> never bursts
     fired = any(
-        a.observe("8.8.8.8", "10.0.0.5", "x.com", qr=1, rcode=3, qtype=1, now=float(i * 100))
+        a.observe("8.8.8.8", "10.0.0.5", f"x{i}.com", qr=1, rcode=3, qtype=1, now=float(i * 100))
         for i in range(20)
     )
     assert not fired

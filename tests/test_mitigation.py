@@ -1,5 +1,5 @@
-"""Unit tests for the mitigation engine. A recording fake stands in for netsh,
-so these never touch the real firewall."""
+"""Unit tests for the mitigation engine. A recording fake stands in for the
+effector, so these never touch a real firewall."""
 
 import json
 
@@ -14,14 +14,14 @@ from netwatch_mitigation import (
     INVALID,
     PENDING_APPROVAL,
     Mitigator,
-    WindowsFirewall,
+    RecordingFirewall,
     is_allowlisted,
     rule_name_for,
 )
 
 
 class FakeFirewall:
-    """Records block/unblock calls instead of shelling out to netsh."""
+    """Records block/unblock calls."""
 
     def __init__(self):
         self.blocked = []    # (ip, rule_name)
@@ -262,15 +262,11 @@ def test_corrupt_ledger_degrades_gracefully(tmp_path):
     assert m.active == {}
 
 
-def test_dry_run_effector_records_commands_without_running():
-    # default effector is dry-run; assert it builds netsh commands but the
-    # subprocess is never invoked (no exception, commands captured).
+def test_default_effector_records_without_enforcing():
     m = Mitigator(auto=True)
     m.request("8.8.8.8", "r", now=0)
-    cmds = m.effector.commands
-    assert any("add" in c and "dir=in" in " ".join(c) for c in cmds)
-    assert any("dir=out" in " ".join(c) for c in cmds)
-    assert m.effector.dry_run is True
+    assert isinstance(m.effector, RecordingFirewall)
+    assert list(m.effector.commands) == [("block", "8.8.8.8", rule_name_for("8.8.8.8"))]
 
 
 def test_persisted_ledger_is_valid_json(tmp_path):
@@ -295,20 +291,6 @@ class FailingFirewall:
         raise FirewallError("unblock failed")
 
 
-class FailingWindowsFirewall(WindowsFirewall):
-    def __init__(self, fail_on_second=False):
-        super().__init__(dry_run=False)
-        self.fail_on_second = fail_on_second
-        self.run_count = 0
-
-    def _run(self, args):
-        self.commands.append(args)
-        self.run_count += 1
-        if self.fail_on_second and self.run_count == 2:
-            from netwatch_mitigation import FirewallError
-            raise FirewallError("mock outbound block failed")
-
-
 def test_effector_failures():
     from netwatch_mitigation import FirewallError
     # Test 1: request returns MITIGATION_FAILED if block fails
@@ -317,18 +299,7 @@ def test_effector_failures():
     assert m1.request("8.8.8.8", "test", now=0) == "MITIGATION_FAILED"
     assert "8.8.8.8" not in m1.active
 
-    # Test 2: block rollback on partial failure in WindowsFirewall
-    fw_partial = FailingWindowsFirewall(fail_on_second=True)
-    with pytest.raises(FirewallError):
-        fw_partial.block("8.8.8.8", "NetWatch Block 8.8.8.8")
-    # Verify it ran the first block, then second block, then unblocked
-    cmds = fw_partial.commands
-    assert len(cmds) == 3
-    assert "add" in cmds[0] and "dir=in" in " ".join(cmds[0])
-    assert "add" in cmds[1] and "dir=out" in " ".join(cmds[1])
-    assert "delete" in cmds[2]
-
-    # Test 3: unblock preserves active entry if effector raises FirewallError
+    # Test 2: unblock preserves active entry if effector raises FirewallError
     fw_unblock_fail = FailingFirewall(fail_all=True)
     m3 = Mitigator(effector=fw_unblock_fail, auto=True)
     # inject active block directly to bypass failing block()
@@ -337,7 +308,7 @@ def test_effector_failures():
         m3.unblock("8.8.8.8")
     assert "8.8.8.8" in m3.active
 
-    # Test 4: reconcile continues on failure and doesn't pop failed entry
+    # Test 3: reconcile continues on failure and doesn't pop failed entry
     m4 = Mitigator(effector=fw_unblock_fail, auto=True)
     m4.active["8.8.8.8"] = {"rule_name": "NetWatch Block 8.8.8.8", "reason": "test", "created_ts": 0, "expires_ts": 10}
     m4.active["9.9.9.9"] = {"rule_name": "NetWatch Block 9.9.9.9", "reason": "test", "created_ts": 0, "expires_ts": 10}
@@ -405,38 +376,6 @@ def test_explicit_allowlist_ips_are_never_blocked():
     assert m.request("8.8.8.8", "r", now=0) == ALLOWLISTED and m.effector.blocked == []
 
 
-def test_ledger_write_survives_a_target_held_open_on_windows(tmp_path, monkeypatch):
-    import os
-
-    import netwatch_core
-
-    real_replace, calls = os.replace, []
-
-    def held_once(src, dst):
-        calls.append(dst)
-        if len(calls) == 1:
-            raise PermissionError(13, "The process cannot access the file")
-        real_replace(src, dst)
-
-    monkeypatch.setattr(netwatch_core.os, "replace", held_once)
-    ledger = tmp_path / "telemetry_blocks.json"
-    assert netwatch_core.write_json_atomic(str(ledger), {"active": {"1.2.3.4": {}}})
-    assert json.loads(ledger.read_text()) == {"active": {"1.2.3.4": {}}}
-
-
-def test_expiry_drops_a_block_whose_rule_is_already_gone(monkeypatch):
-    import subprocess
-
-    def netsh(args, **kwargs):
-        if "delete" in args:  # netsh exits 1 when no rule has the name
-            raise subprocess.CalledProcessError(1, args, output="\nNo rules match the specified criteria.\n")
-
-    monkeypatch.setattr(subprocess, "run", netsh)
-    m = Mitigator(effector=WindowsFirewall(dry_run=False), auto=True, block_ttl_sec=10)
-    assert m.request("8.8.8.8", "x", now=0) == BLOCK
-    assert m.reconcile(now=100) == ["8.8.8.8"] and not m.active
-
-
 def test_non_canonical_allowlist_entry_and_zoned_target_still_match():
     assert is_allowlisted("2606:4700:4700::1111", (), {"2606:4700:4700:0:0:0:0:1111"})
     assert is_allowlisted("2606:4700:4700::1111%1", (), {"2606:4700:4700::1111"})
@@ -468,23 +407,6 @@ def _ui_warnings():
     return messages, lambda: logger.removeHandler(handler)
 
 
-def test_failed_rollback_unblock_is_logged():
-    from netwatch_mitigation import FirewallError
-
-    class Fw(WindowsFirewall):
-        def _run(self, args):
-            if "dir=out" in args or "delete" in args:
-                raise FirewallError("netsh failed")
-
-    messages, stop = _ui_warnings()
-    try:
-        with pytest.raises(FirewallError):
-            Fw(dry_run=False).block("203.0.113.5", "r")
-    finally:
-        stop()
-    assert len(messages) == 1 and "rollback" in messages[0]
-
-
 def test_failing_reconcile_logs_once_per_ip_and_keeps_the_entry():
     from netwatch_mitigation import FirewallError
 
@@ -493,7 +415,7 @@ def test_failing_reconcile_logs_once_per_ip_and_keeps_the_entry():
 
         def unblock(self, rule_name):
             if self.fail:
-                raise FirewallError("netsh failed")
+                raise FirewallError("unblock failed")
             super().unblock(rule_name)
 
     fw = Stuck()
@@ -511,12 +433,10 @@ def test_failing_reconcile_logs_once_per_ip_and_keeps_the_entry():
 
 
 def test_command_trail_bounded():
-    from netwatch_mitigation import WindowsFirewall
-
-    fw = WindowsFirewall()
+    fw = RecordingFirewall()
     for index in range(1000):
         fw.block(f"93.184.{index // 250}.{index % 250}", f"rule-{index}")
-    assert len(fw.commands) <= 256 and "name=rule-999" in " ".join(fw.commands[-1])
+    assert len(fw.commands) <= 256 and fw.commands[-1][2] == "rule-999"
 
 
 def test_pending_queue_is_capped():

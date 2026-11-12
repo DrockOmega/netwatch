@@ -38,6 +38,11 @@ def beacon(event_id, **extra):
     return detection("DOD_CORE", "BEACON_ANOMALY", "203.0.113.9", source_event_id=event_id, **data)
 
 
+
+def zeek(event_id, **extra):
+    data = {"severity": "alert", "src_ip": "192.168.1.20", "dst_ip": "203.0.113.9", "community_id": CID} | extra
+    return detection("ZEEK", "ZEEK_NOTICE", "203.0.113.9", source_event_id=event_id, **data)
+
 @pytest.fixture
 def store(tmp_path):
     store = DurableIncidentStore(tmp_path / "security.db", rule_pack=PACK, local_networks=LOCAL)
@@ -184,7 +189,7 @@ def test_store_from_config_loads_the_pack_and_locality(tmp_path):
     config = {"INCIDENT_DB": str(tmp_path / "a.db"), "CORRELATION_RULES": str(ROOT / "correlation_rules.json"),
               "LOCAL_PREFIXES": LOCAL, "LOCAL_PREFIXES6": ()}
     store = security_store_from_config(config)
-    assert [rule["id"] for rule in store.rules] == ["XS-002", "XS-003", "XS-004"]
+    assert [rule["id"] for rule in store.rules] == ["XS-001", "XS-002", "XS-003", "XS-004"]
     assert store.local_networks == LOCAL
     store.close()
     missing = security_store_from_config({**config, "INCIDENT_DB": str(tmp_path / "b.db"),
@@ -327,3 +332,32 @@ def test_api_rules_and_hunts_require_auth_and_validate(service):
         with pytest.raises(HTTPError) as rejected:
             client.request("hunts", bad)
         assert rejected.value.code == 400
+
+
+def test_suricata_alert_and_zeek_notice_on_one_flow_join_by_xs001(tmp_path):
+    store = DurableIncidentStore(tmp_path / "security.db", rule_pack=PACK, local_networks=LOCAL)
+    first = store.add(suricata("eve-1"), now=1)
+    joined = store.add(zeek("zeek-1"), now=2)
+    assert joined["incident_id"] == first["incident_id"] and joined["rules"] == ["XS-001"]
+    assert joined["sources"] == ["SURICATA", "ZEEK"]
+
+
+def test_dismissed_case_stays_closed_on_a_repeat_and_reopens_on_escalation(store):
+    first = store.add(detection("DOD_CORE", "BASELINE_ANOMALY", "aa:bb:cc:00:00:01", severity="anomaly",
+                                source_event_id="b-1"), now=1)
+    store.update_case(first["incident_id"], actor="t", status="Dismissed", closure_reason="streaming device")
+    repeat = store.add(detection("DOD_CORE", "BASELINE_ANOMALY", "aa:bb:cc:00:00:01", severity="anomaly",
+                                 source_event_id="b-2"), now=2)
+    assert (repeat["status"], repeat["count"], repeat["closure_reason"]) == ("Dismissed", 2, "streaming device")
+    worse = store.add(detection("DOD_CORE", "BASELINE_ANOMALY", "aa:bb:cc:00:00:01", severity="alert",
+                                source_event_id="b-3"), now=3)
+    assert (worse["status"], worse["closure_reason"]) == ("Open", "")
+    store.update_case(worse["incident_id"], actor="t", status="Resolved", closure_reason="fixed")
+    assert store.add(detection("DOD_CORE", "BASELINE_ANOMALY", "aa:bb:cc:00:00:01", severity="alert",
+                               source_event_id="b-4"), now=4)["status"] == "Open"
+
+
+def test_accepted_egress_files_resolved_out_of_the_open_list(store):
+    case = store.add(detection("DOD_CORE", "ACCEPTED_EGRESS", "203.0.113.9", severity="info",
+                               source_event_id="acc-1"), now=1)
+    assert case["status"] == "Resolved" and case["closure_reason"]

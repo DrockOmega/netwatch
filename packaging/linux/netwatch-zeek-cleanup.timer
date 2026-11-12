@@ -1,0 +1,9 @@
+[Unit]
+Description=Delete Zeek logs untouched for 3 days (daily 04:05)
+
+[Timer]
+OnCalendar=*-*-* 04:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

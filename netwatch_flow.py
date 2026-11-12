@@ -59,8 +59,17 @@ class FlowTracker:
 
     def observe(self, event, *, src_local=False, dst_local=False):
         now = float(event["timestamp"])
-        key = self.key_for(event)
-        source = _endpoint(event["src_ip"], event.get("source_port"))
+        protocol = str(event.get("protocol") or "IP").upper()
+        src_ip, src_port, dst_ip, dst_port = event["src_ip"], event.get("source_port"), event["dst_ip"], event.get("port")
+        # _endpoint() returns exactly these for parser values (bytes, int port in range)
+        source = ((src_ip, src_port) if type(src_ip) is bytes and type(src_port) is int and 0 <= src_port <= 65535
+                  else _endpoint(src_ip, src_port))
+        target = ((dst_ip, dst_port) if type(dst_ip) is bytes and type(dst_port) is int and 0 <= dst_port <= 65535
+                  else _endpoint(dst_ip, dst_port))
+        key = (protocol, source, target) if source <= target else (protocol, target, source)  # key_for(event)
+        raw_domain = event.get("sni_domain")
+        domain = "" if not raw_domain or raw_domain == "encrypted-payload" else self._usable_domain(raw_domain)
+        ja4 = str(event.get("ja4") or "")
         flow = self.flows.get(key)
         created = flow is None
         if created:
@@ -85,8 +94,8 @@ class FlowTracker:
                 "bytes_ab": 0,
                 "bytes_ba": 0,
                 "tcp_state": "new" if key[0] == "TCP" else "active",
-                "domain": self._usable_domain(event.get("sni_domain")),
-                "ja4": str(event.get("ja4") or ""),
+                "domain": domain,
+                "ja4": ja4,
                 "source_mac": str(event.get("mac_src") or ""),
                 "identity_revision": 0,
                 "seen_egress": False,
@@ -95,13 +104,14 @@ class FlowTracker:
         else:
             self.flows.move_to_end(key)
 
-        ab = source == flow["endpoint_a"]
-        suffix = "ab" if ab else "ba"
-        flow[f"packets_{suffix}"] += 1
-        flow[f"bytes_{suffix}"] += max(0, int(event.get("size_bytes") or 0))
-        flow["last_seen"] = max(flow["last_seen"], now)
-        domain = self._usable_domain(event.get("sni_domain"))
-        ja4 = str(event.get("ja4") or "")
+        if source == flow["endpoint_a"]:
+            flow["packets_ab"] += 1
+            flow["bytes_ab"] += max(0, int(event.get("size_bytes") or 0))
+        else:
+            flow["packets_ba"] += 1
+            flow["bytes_ba"] += max(0, int(event.get("size_bytes") or 0))
+        if now > flow["last_seen"]:  # max(last_seen, now), NaN included
+            flow["last_seen"] = now
         identity_changed = False
         if domain and domain != flow["domain"]:
             flow["domain"] = domain
@@ -114,7 +124,19 @@ class FlowTracker:
         first_local_egress = bool(src_local and not dst_local and not flow["seen_egress"])
         if src_local and not dst_local:
             flow["seen_egress"] = True
-        self._advance_tcp(flow, str(event.get("tcp_flags") or ""))
+        if first_local_egress:
+            flow["beacon_started"] = now
+            flow["beacon_replies"] = 0
+        beacon_sample_at = None
+        tcp_flags = str(event.get("tcp_flags") or "") if protocol == "TCP" else ""
+        if "beacon_started" in flow:
+            flow["beacon_replies"] += not src_local and "R" not in tcp_flags
+            # A TCP flow is a check-in only once it carries payload: a retry nothing answers is not one (b936).
+            # Bulk shedding can hide every payload frame, so a second answer from the peer also counts.
+            if protocol != "TCP" or int(event.get("payload_bytes", 1) or 0) > 0 or flow["beacon_replies"] >= 2:
+                beacon_sample_at = flow.pop("beacon_started")
+        if protocol == "TCP":
+            self._advance_tcp(flow, tcp_flags)
         snapshot = self.snapshot(flow)
         snapshot["observation_direction"] = (
             "egress" if src_local and not dst_local
@@ -123,6 +145,7 @@ class FlowTracker:
             else "any"
         )
         snapshot["first_local_egress"] = first_local_egress
+        snapshot["beacon_sample_at"] = beacon_sample_at
         snapshot["identity_changed"] = identity_changed
         return snapshot, created
 
@@ -161,11 +184,13 @@ class FlowTracker:
 
     @staticmethod
     def snapshot(flow):
-        initiator_is_a = flow["initiator"] == flow["endpoint_a"]
-        up = "ab" if initiator_is_a else "ba"
-        down = "ba" if initiator_is_a else "ab"
         initiator = flow["initiator"]
-        responder = flow["endpoint_b"] if initiator_is_a else flow["endpoint_a"]
+        if initiator == flow["endpoint_a"]:
+            responder, packets_up, packets_down, bytes_up, bytes_down = (
+                flow["endpoint_b"], flow["packets_ab"], flow["packets_ba"], flow["bytes_ab"], flow["bytes_ba"])
+        else:
+            responder, packets_up, packets_down, bytes_up, bytes_down = (
+                flow["endpoint_a"], flow["packets_ba"], flow["packets_ab"], flow["bytes_ba"], flow["bytes_ab"])
         return {
             "flow_id": flow["flow_id"],
             "protocol": flow["protocol"],
@@ -178,10 +203,10 @@ class FlowTracker:
             "first_seen": flow["first_seen"],
             "last_seen": flow["last_seen"],
             "duration_sec": max(0.0, flow["last_seen"] - flow["first_seen"]),
-            "packets_up": flow[f"packets_{up}"],
-            "packets_down": flow[f"packets_{down}"],
-            "bytes_up": flow[f"bytes_{up}"],
-            "bytes_down": flow[f"bytes_{down}"],
+            "packets_up": packets_up,
+            "packets_down": packets_down,
+            "bytes_up": bytes_up,
+            "bytes_down": bytes_down,
             "tcp_state": flow["tcp_state"],
             "domain": flow["domain"],
             "ja4": flow["ja4"],
@@ -203,6 +228,18 @@ def device_endpoint_rule(entry):
     if len(mac) != 17 or not nets or any(net.prefixlen == 0 for net in nets):
         return None
     return mac, nets, ports
+
+
+def device_domain_rule(entry):
+    """``{"mac", "domains"}`` -> ``(mac, suffixes)``, or None when unusable."""
+    try:
+        mac = str(entry["mac"]).strip().lower()
+        suffixes = frozenset(str(d).lower().strip(".") for d in entry["domains"] if str(d).strip("."))
+    except (KeyError, TypeError, AttributeError):
+        return None
+    if len(mac) != 17 or not suffixes:
+        return None
+    return mac, suffixes
 
 
 def device_window_rule(entry):
@@ -263,7 +300,7 @@ class BeaconDetector:
     def __init__(self, *, min_samples=6, max_cv=0.12, min_period_sec=5,
                  max_period_sec=3600, cooldown_sec=900, max_keys=20_000,
                  ignored_udp_ports=(), ignored_domains=(), ignored_destinations=(),
-                 ignored_device_endpoints=()):
+                 ignored_device_endpoints=(), ignored_device_domains=()):
         self.min_samples = max(3, int(min_samples))
         self.max_cv = max(0.0, float(max_cv))
         self.min_period_sec = max(0.1, float(min_period_sec))
@@ -274,21 +311,37 @@ class BeaconDetector:
         self.ignored_domains = frozenset(
             str(domain).lower().strip(".") for domain in ignored_domains if str(domain).strip(".")
         )
-        normalized_destinations = set()
+        normalized_destinations, networks = set(), []
         for value in ignored_destinations:
             try:
                 normalized_destinations.add(ipaddress.ip_address(value).packed)
+                continue
+            except ValueError:
+                pass
+            try:
+                network = ipaddress.ip_network(value)
             except ValueError:
                 continue
+            if network.prefixlen:  # A /0 would switch the detector off.
+                networks.append(network)
         self.ignored_destinations = frozenset(normalized_destinations)
+        # First-party platform ranges (a provider's own push/sync services), never shared CDN space.
+        self.ignored_networks = tuple(networks)
         # {mac: [(networks, ports)]}: one device's keepalives to its own vendor/resolver ranges only.
         self.ignored_device_endpoints = {}
         for entry in ignored_device_endpoints:
             parsed = device_endpoint_rule(entry)
             if parsed is not None:
                 self.ignored_device_endpoints.setdefault(parsed[0], []).append(parsed[1:])
+        # {mac: suffixes}: services that can carry C2 (chat webhooks, CI) stay visible on every other device.
+        self.ignored_device_domains = {}
+        for entry in ignored_device_domains:
+            parsed = device_domain_rule(entry)
+            if parsed is not None:
+                self.ignored_device_domains[parsed[0]] = self.ignored_device_domains.get(parsed[0], frozenset()) | parsed[1]
         self.timestamps = {}
         self.last_alert = {}
+        self.ignored_keys = set()  # (device, dst, port, proto) once named as an ignored domain (b1068)
 
     def observe(self, flow, now=None):
         if not flow.get("src_local") or flow.get("dst_local"):
@@ -297,10 +350,29 @@ class BeaconDetector:
         if (str(flow.get("protocol") or "").upper() == "UDP"
                 and {int(flow.get("destination_port") or 0), int(flow.get("source_port") or 0)} & self.ignored_udp_ports):
             return None
-        domain = str(flow.get("domain") or "").lower().strip(".")
-        if domain and any(domain == suffix or domain.endswith(f".{suffix}") for suffix in self.ignored_domains):
+        key = (
+            flow.get("source_mac") or bytes(flow["src_ip"]).hex(),
+            bytes(flow["dst_ip"]),
+            int(flow.get("destination_port") or 0),
+            str(flow.get("protocol") or ""),
+        )
+        if key in self.ignored_keys:
+            return None
+        domains = {str(name or "").lower().strip(".") for name in (flow.get("domain"), *(flow.get("domains") or ()))}
+        suffixes = self.ignored_domains | self.ignored_device_domains.get(str(flow.get("source_mac") or "").lower(), frozenset())
+        if any(domain and (domain == suffix or domain.endswith(f".{suffix}"))
+               for domain in domains for suffix in suffixes):
+            # Unnamed samples to a host once named as ignored (no SNI, encrypted DNS) must not build a series (b1068).
+            if len(self.ignored_keys) >= self.max_keys:
+                self.ignored_keys.clear()
+            self.ignored_keys.add(key)
+            self.timestamps.pop(key, None)
+            self.last_alert.pop(key, None)
             return None
         if bytes(flow["dst_ip"]) in self.ignored_destinations:
+            return None
+        if self.ignored_networks and any(ipaddress.ip_address(bytes(flow["dst_ip"])) in net
+                                         for net in self.ignored_networks):
             return None
         rules = self.ignored_device_endpoints.get(str(flow.get("source_mac") or "").lower())
         if rules:
@@ -309,12 +381,6 @@ class BeaconDetector:
             if any((not ports or port in ports) and any(dst in net for net in nets) for nets, ports in rules):
                 return None
         now = float(flow["first_seen"] if now is None else now)
-        key = (
-            flow.get("source_mac") or bytes(flow["src_ip"]).hex(),
-            bytes(flow["dst_ip"]),
-            int(flow.get("destination_port") or 0),
-            str(flow.get("protocol") or ""),
-        )
         if key not in self.timestamps and len(self.timestamps) >= self.max_keys:
             victim = min(self.timestamps, key=lambda candidate: self.timestamps[candidate][-1])
             self.timestamps.pop(victim, None)
@@ -345,6 +411,7 @@ class BeaconDetector:
             "dst_ip": flow["dst_ip"],
             "port": flow["destination_port"],
             "protocol": flow["protocol"],
+            "src_mac": str(flow.get("source_mac") or ""),  # Rotating IPv6 sources stay attributable.
         }
 
 
@@ -464,6 +531,8 @@ class HumanWebClassifier:
             mapping.popitem(last=False)
 
     def _remember_dns(self, source, event, now):
+        if event.get("dns_qr") is None:  # most packets: int(None) would raise and return below
+            return
         try:
             is_query = int(event.get("dns_qr")) == 0
         except (TypeError, ValueError):

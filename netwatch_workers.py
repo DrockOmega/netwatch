@@ -22,6 +22,7 @@ from netwatch_core import (
     analyze_udp_flood,
     analyze_volumetric_exfil,
     arena_dtype,
+    bulk_shed_flow,
     community_id_v1,
     compile_v4_prefixes,
     compile_v6_prefixes,
@@ -39,6 +40,7 @@ from netwatch_core import (
     try_put_drop_oldest_with_eviction,
     try_put_no_drop,
     ttl_profile,
+    write_json_atomic,
 )
 from netwatch_db import compact_event_rows, encode_packet_rows, packet_row_key
 from netwatch_log import setup_logging
@@ -47,6 +49,9 @@ from netwatch_security_store import _event_time, publish_detection, security_db_
 SNIFFER_STALL_DUMP_SEC = 20  # well past one select (1 s) and a 256-frame dispatch
 INGEST_HOLD_BATCHES = 64  # full batches the sniffer holds for a busy core (~32k events) before it pauses reads
 GEO_CACHE_MAX = 65536  # distinct destinations remembered before the country cache starts over
+# b793: a GEO-THREAT on an unnamed 443 flow from a device on a domain ACCEPTED_EGRESS entry waits this long
+# (packet clock) for the TLS hello's SNI to name it; Private DNS gives no DNS answer to learn from first.
+GEO_NAME_HOLD_SEC = 10
 ALERT_BUSY_TIMEOUT_MS = 250  # packet-path alert commits; a busier store defers them to the analysis thread
 EVIDENCE_REQUESTS_PER_PASS = 100  # evidence_queue maxsize: one pass still empties a full queue, a flood waits a pass
 MERGE_STALL_WARN_SEC = 30  # a shard warns (and every minute after) while the merge reads none of its records
@@ -309,7 +314,7 @@ def io_sniffer_process(ingestion_queue, evidence_queue, config, worker_status_qu
     pending_lock = threading.Lock()
     flush_lock = threading.Lock()  # one shipper at a time: a held backlog is shipped from its head
     last_flush = [time.time()]
-    # A full ingestion queue holds events here; at hold_max the read loop stops draining Npcap, so a
+    # A full ingestion queue holds events here; at hold_max the read loop stops draining libpcap, so a
     # burst waits in the kernel buffer (PCAP_BUFFER_BYTES) instead of being dropped. Only one dispatch
     # can land past hold_max, so the hard cap (twice it) is reached only if that bound is broken.
     hold_max = INGEST_HOLD_BATCHES * batch_max
@@ -509,8 +514,8 @@ def io_sniffer_process(ingestion_queue, evidence_queue, config, worker_status_qu
             tuned = False
             log.warning("capture buffer tuning failed (%s: %s); keeping driver default", type(exc).__name__, exc)
         try:
-            # Required with the Windows pcap event: select establishes readiness,
-            # nonblocking recv makes a stale event a normal empty read.
+            # select establishes readiness; nonblocking recv makes a spurious wake a
+            # normal empty read.
             direct_sock.pcap_fd.setnonblock(True)
         except Exception as exc:
             log.warning(
@@ -595,8 +600,8 @@ def io_sniffer_process(ingestion_queue, evidence_queue, config, worker_status_qu
     # compatibility listener keeps packets flowing while a direct re-open fails.
     last_arm = float("-inf")
     while shutdown_event is None or not shutdown_event.is_set():
-        # Re-arming joins the old watchdog thread and starts a new one (~22 us CPU on Linux, more on
-        # Windows), so it happens once a second, not once per wake; a stall still dumps within 20 s.
+        # Re-arming joins the old watchdog thread and starts a new one (~22 us CPU), so it happens
+        # once a second, not once per wake; a stall still dumps within 20 s.
         if stall_file is not None and time.monotonic() - last_arm >= 1.0:
             last_arm = time.monotonic()
             faulthandler.dump_traceback_later(SNIFFER_STALL_DUMP_SEC, file=stall_file)  # re-arming cancels the last
@@ -652,7 +657,7 @@ def io_sniffer_process(ingestion_queue, evidence_queue, config, worker_status_qu
                         else:
                             time.sleep(idle_backoff)
             else:
-                # Compatibility path only. Direct Npcap ownership is the production
+                # Compatibility path only. Direct libpcap ownership is the production
                 # path; if unavailable, Scapy can still deliver raw frame bytes.
                 from scapy.layers.inet import IP, TCP, UDP  # noqa: F401
                 from scapy.layers.inet6 import IPv6  # noqa: F401
@@ -933,6 +938,50 @@ def durable_analysis_process(alert_queue, evidence_queue, inventory_queue, confi
     store.close()
 
 
+ZEEK_SEEN_MAX = 65_536  # Zeek uids remembered so a late conn_interim never re-adds a finished connection
+
+
+class LearnedNames(dict):
+    """Last name per external packed address, saved as JSON so a restart keeps it."""
+
+    def __init__(self, path):
+        super().__init__()
+        self.path, self.dirty = path, False
+        self.sni = set()  # addresses named by SNI this run; a name loaded from disk stays replaceable
+        # A shared CDN address answers for several names; the beacon ignore checks the recent ones this
+        # device itself resolved or named there, so another device's ad traffic never blinds it (b743).
+        self.recent = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                self.update({bytes.fromhex(addr): name for addr, name in json.load(f).items()})
+        except (OSError, TypeError, ValueError, AttributeError):
+            pass  # no file yet, or unreadable: start empty, as before
+
+    def learn(self, addr, name, dns=False, device=None):
+        if dns and addr in self.sni:  # a DNS qname (often a CDN host) never replaces the SNI name
+            return
+        if len(self) >= GEO_CACHE_MAX and addr not in self:
+            self.clear()
+            self.sni.clear()
+            self.recent.clear()
+        if not dns:
+            self.sni.add(addr)
+        if device is not None:
+            if len(self.recent) >= GEO_CACHE_MAX and (device, addr) not in self.recent:
+                self.recent.clear()
+            names = self.recent.setdefault((device, addr), [])
+            if name not in names:
+                names.append(name)
+                del names[:-4]
+        if self.get(addr) != name:
+            self[addr] = name
+            self.dirty = True
+
+    def save(self):
+        if self.dirty and self.path and write_json_atomic(self.path, {a.hex(): n for a, n in self.items()}):
+            self.dirty = False
+
+
 def dod_core_process(
     ingestion_queue,
     render_queue,
@@ -960,6 +1009,9 @@ def dod_core_process(
     run_flows = shard != "merge"  # per-packet flow work: the single core or a shard
     run_global = not isinstance(shard, int)  # cross-device state: the single core or the merge
     notices = shard in (None, 0)  # one process reports policy/signature file state, as the single core did
+    # The headless service only discards render rows; pickling them (and evicting from its full queue) cost a
+    # single-host upload ~30% of a shard's throughput on 2026-10-19.
+    render_rows = config.get("_RENDER_ROWS", True)
     log = setup_logging("core" if run_global else f"core-{shard}", config)
     security_store = security_store_from_config(config) if run_global else None
     log.info("allocating arena and loading rulesets...")
@@ -1018,6 +1070,7 @@ def dod_core_process(
     # Per-device egress baselining (roadmap #2). Accumulates each local device's
     # egress bytes per window, then scores the window against that device's learned
     # norm. Guarded like the inventory — a fault here never takes the core down.
+    from netwatch_inventory import is_usable_mac, normalize_mac  # pure MAC helpers
     baseline = None
     if run_global and config.get("BASELINE_ENABLED", True):
         try:
@@ -1029,6 +1082,7 @@ def dod_core_process(
                 z_threshold=config.get("BASELINE_Z", 4.0),
                 rel_floor=config.get("BASELINE_REL_FLOOR", 0.15),
                 abs_floor=config.get("BASELINE_ABS_FLOOR", 50_000),
+                key_floors={normalize_mac(m): f for m, f in config.get("BASELINE_DEVICE_FLOORS", {}).items()},
                 ledger_path=config.get("BASELINE_LEDGER"),
             )
         except Exception as e:
@@ -1037,7 +1091,6 @@ def dod_core_process(
     baseline_window = config.get("BASELINE_WINDOW_SEC", 60)
     baseline_bytes = {}  # device MAC -> egress bytes accumulated this window
     last_baseline_flush = time.time()
-    from netwatch_inventory import is_usable_mac, normalize_mac  # pure MAC helpers
 
     # The durable analyzers run in durable_analysis_process: in the packet loop their writes waited
     # out other processes' writer locks and the ingestion queue overflowed (the sensor, ~20k packets/s
@@ -1237,7 +1290,7 @@ def dod_core_process(
     free_slots = list(range(MAX_ENTITIES - 1, -1, -1))  # LIFO stack of unused slots
     ip_to_idx = {}
     sweep_targets = {}  # src -> {dst: None}, current sweep window only
-    # Known scanners (the dev host's own LAN sweep): packed addresses, never port-sweep candidates.
+    # Known scanners (the console host's own LAN sweep): packed addresses, never port-sweep candidates.
     sweep_ignored = frozenset(ip_pack(str(ip)) for ip in config.get("SWEEP_IGNORE_SOURCES", ())) - {None}
     # {mac: [(networks, ports)]}: LAN UDP one known device sends to its peers' ports (Tailscale WireGuard
     # between the nodes) is a transfer, not a flood. Same entry shape as BEACON_IGNORE_DEVICE_ENDPOINTS.
@@ -1277,6 +1330,8 @@ def dod_core_process(
 
     accepted_rules = accepted_egress_rules(config.get("ACCEPTED_EGRESS"))
     accepted_last = {}  # (rule, kind, dst) -> last info record time; expired rules are reported once
+    domain_rule_macs = frozenset(mac for rule in accepted_rules if rule["domains"] for mac in rule["macs"])
+    geo_held = {}  # (src, dst) -> (deadline, GEO-THREAT message): held until SNI names the flow or time runs out
 
     def accept_egress(kind, mac, domain, dst, src_dotted, dst_dotted, now):
         """None when no live ACCEPTED_EGRESS entry covers this finding; else the info records (possibly none,
@@ -1331,6 +1386,40 @@ def dod_core_process(
     def is_local(ip_key):
         return is_local_ip(ip_key, local_prefixes, local_prefixes6)
 
+    # Pure per-address facts, memoised because one device's flows repeat the same few endpoints (an upload is
+    # ~30k packets/s between two addresses). Bounded like the country cache; unhashable keys are not cached.
+    endpoint_cache = {}  # packed address -> (text, local)
+    intel_memo, intel_memo_for = {}, [None]  # packed address / domain -> intel hit, for the IndicatorSet it came from
+
+    def endpoint_of(ip_key):
+        value = (ip_str(ip_key), is_local(ip_key))
+        try:
+            if len(endpoint_cache) >= GEO_CACHE_MAX:
+                endpoint_cache.clear()
+            endpoint_cache[ip_key] = value
+        except TypeError:
+            pass
+        return value
+
+    def intel_hit(intel, key, domain):
+        """``intel.match_domain(key)``, or for an address ``intel.match_ip`` when it is globally routable."""
+        if intel is not intel_memo_for[0]:  # a reload rebinds the set; the held reference keeps its id unique
+            intel_memo.clear()
+            intel_memo_for[0] = intel
+        try:
+            return intel_memo[key]
+        except KeyError:
+            pass
+        except TypeError:
+            return intel.match_domain(key) if domain else intel.match_ip(key) if is_global_ip(key) else None
+        hit = intel.match_domain(key) if domain else intel.match_ip(key) if is_global_ip(key) else None
+        if len(intel_memo) >= GEO_CACHE_MAX:
+            intel_memo.clear()
+        intel_memo[key] = hit
+        return hit
+
+    ttl_guesses = {ttl: ttl_profile(ttl, config["OS_THRESHOLD_NIX"], config["OS_THRESHOLD_WIN"]) for ttl in range(256)}
+
     detector_alert_gate = AlertGate(config["DETECTOR_ALERT_COOLDOWN_SEC"])
     exfil_alert_gate = AlertGate(config["EXFIL_ALERT_COOLDOWN_SEC"])
 
@@ -1362,10 +1451,22 @@ def dod_core_process(
                     ignored_domains=config.get("BEACON_IGNORE_DOMAINS", ()),
                     ignored_destinations=config.get("BEACON_IGNORE_DESTINATIONS", ()),
                     ignored_device_endpoints=config.get("BEACON_IGNORE_DEVICE_ENDPOINTS", ()),
+                    ignored_device_domains=config.get("BEACON_IGNORE_DEVICE_DOMAINS", ()),
                 )
         except Exception as exc:
             log.error("flow tracking disabled — init failed: %s: %s", type(exc).__name__, exc)
             flow_tracker = beacon_detector = human_web_classifier = None
+    # Last name per external address, from DNS answers and TLS server names. A beacon sample can land
+    # before a flow's hello, and some apps never send SNI, so BEACON_IGNORE_DOMAINS and
+    # ACCEPTED_EGRESS read the learned name. shortcut: answers from a LAN resolver shard by address pair,
+    # not by the asking device; fine while devices use Comcast's resolvers directly.
+    # Kept on disk: a client whose name came from a cached DNS answer is never renamed after a restart.
+    names_dir = os.path.dirname(config.get("DEVICE_LEDGER") or "")
+    learned_names = LearnedNames(
+        os.path.join(names_dir, f"telemetry_names_{shard if isinstance(shard, int) else 'core'}.json")
+        if run_flows and names_dir else None)
+    learn_name = learned_names.learn
+    last_names_save = time.time()
 
     policy_box = [None]
     policy_state = {}
@@ -1421,17 +1522,17 @@ def dod_core_process(
     if run_global:
         analysis_thread.start()
 
-    def observe_global(record, current_loop_time):
-        """Cross-device analytics for one event, in capture order: the arena detectors, inventory,
-        baseline, DNS, JA3, beacons and every rate limit. Returns True if an arena detector or a
-        signature alerted (the render row's flag). The single core calls it per event; the merge
-        per shard record."""
-        nonlocal dev_new_sent, dev_new_dropped, intel_cooldown
-        (_, src, dst, src_dotted, dst_dotted, current_time, size, dport, sport, protocol, mac_src, mac_dst,
-         src_local, dst_local, outbound_web, tcp_flags, extra) = record
-        policy_item, beacon_item, dns_item, ja3_item, intel_item, signature_msgs = extra or NO_EXTRA
+    # BULK_SHED_BYTES: the kernel drops bulk TCP/QUIC payload, so those flows' volume comes from Zeek conn records,
+    # read here from the committed ZEEK stream (records before this start are not replayed).
+    bulk_shed = run_global and bool(config.get("BULK_SHED_BYTES"))
+    zeek_seen = {}  # uid -> (end time, largest counters) of the last record, oldest first
+    zeek_cursor = (security_store._read("SELECT COALESCE(MAX(sequence), 0) FROM security_source_order")[0][0]
+                   if bulk_shed else 0)
+    last_zeek_poll = 0.0
+    packet_clock = None  # the newest packet time seen: Zeek deltas land on the detectors' own clock
 
-        # Resolve each endpoint to an arena slot, allocating (and evicting) as needed.
+    def arena_slots(src, dst, current_loop_time):
+        """Resolve both endpoints to arena slots, allocating (and evicting) as needed."""
         keys_to_allocate = []
         if src not in ip_to_idx:
             keys_to_allocate.append(src)
@@ -1478,8 +1579,95 @@ def dod_core_process(
             arena[target_slot] = np.zeros((), dtype=arena.dtype)
             ip_to_idx[ip_key] = target_slot
             slot_last_access[target_slot] = current_loop_time
+        return ip_to_idx[src], ip_to_idx[dst]
 
-        s_idx, d_idx = ip_to_idx[src], ip_to_idx[dst]
+    def observe_volume(s_idx, src, dst, src_dotted, dst_dotted, src_local, dst_local, sport, dport, protocol,
+                       mac_src, size, packets, current_time, span=0.0, replies=0, payload=None):
+        """UDP flood, EXFIL and BASELINE for one packet, or for a Zeek conn delta that covers ``span`` seconds,
+        scaled to each detector's window (the delta's average rate). ``payload`` (Zeek's application bytes)
+        feeds EXFIL and the egress baseline in place of ``size`` so the ACK stream of a fast download is not egress. Returns the alert tuples."""
+        def scaled(amount, window):
+            return amount if span <= window else amount * window / span
+
+        alerts = []
+        # Inbound QUIC (an external server's UDP/443 to a local client) is a download, not a flood.
+        tunnel = protocol == "UDP" and (sport in tunnel_udp_ports or dport in tunnel_udp_ports)
+        # Outbound QUIC the server answers (at least 1 reply per 10 sent) is a session; a one-way blast still counts.
+        quic_session = dport == 443 and src_local and not dst_local and replies * 10 >= packets
+        if (protocol == "UDP" and not tunnel and not quic_session and not (sport == 443 and dst_local and not src_local)
+                and not (dst_local and udp_flood_exempt(mac_src, dst, dport))):
+            res = analyze_udp_flood(arena[s_idx], current_time, config, src_dotted,
+                                    scaled(packets, config["UDP_FLOOD_WINDOW_SEC"]))
+            if res and detector_alert_gate.allow("udp", src, current_time):
+                alerts.append((res, src))
+        # Exfiltration is a property of the SENDER, and only of traffic
+        # actually leaving the network. Accumulating on the destination row
+        # counted every inbound byte as egress, so any ordinary download
+        # crossing EXFIL_THRESHOLD_BYTES alerted against the local host.
+        if src_local and not dst_local and not tunnel:
+            res = analyze_volumetric_exfil(arena[s_idx], current_time, config, dst_dotted,
+                                           scaled(size if payload is None else payload, config["EXFIL_WINDOW_SEC"]))
+            if (res and not exfil_exempt(mac_src, dst, current_time)
+                    and exfil_alert_gate.allow("exfil", (src, dst), current_time)):
+                alerts.append((f"{res} by {src_dotted}", dst, {"src_ip": src_dotted, "src_mac": str(mac_src or "")}))
+        # [BASELINE] accumulate a local device's egress bytes for the window.
+        # Egress = the device is the source; only local senders are baselined.
+        if baseline is not None and src_local and is_usable_mac(mac_src):
+            bkey = normalize_mac(mac_src)
+            baseline_bytes[bkey] = baseline_bytes.get(bkey, 0) + int(scaled(size if payload is None else payload, baseline_window))
+        return alerts
+
+    def observe_zeek_conn(native, interim, now):
+        """One Zeek conn (final) or conn_interim (cumulative, long connection) record. A shed flow's growth
+        over the largest counters already seen for its uid feeds the volume detectors, each direction as
+        its sender, so a late interim after the final record adds nothing."""
+        orig_p, resp_p = native.get("id.orig_p"), native.get("id.resp_p")
+        proto = str(native.get("proto") or "").upper()
+        if not bulk_shed_flow(proto, orig_p, resp_p):
+            return
+        counters = tuple(value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+                         for value in (native.get(k) for k in ("orig_pkts", "orig_ip_bytes", "resp_pkts", "resp_ip_bytes",
+                                                             "orig_bytes", "resp_bytes")))
+        ts, duration = float(native.get("ts") or 0.0), float(native.get("duration") or 0.0)
+        start, end = (ts - duration, ts) if interim else (ts, ts + duration)
+        uid = str(native.get("uid"))
+        last_end, seen = zeek_seen.pop(uid, (start, (0,) * len(counters)))
+        zeek_seen[uid] = (max(last_end, end), tuple(map(max, seen, counters)))
+        if len(zeek_seen) > ZEEK_SEEN_MAX:
+            zeek_seen.pop(next(iter(zeek_seen)))
+        span = max(0.0, end - last_end)
+        orig, resp = ip_pack(native["id.orig_h"]), ip_pack(native["id.resp_h"])
+        has_payload = native.get("orig_bytes") is not None  # absent: EXFIL falls back to IP bytes
+        orig_new, resp_new = counters[0] - seen[0], counters[2] - seen[2]
+        for src, dst, sport, dport, mac, (packets, ip_bytes, payload), replies in (
+                (orig, resp, orig_p, resp_p, native.get("orig_l2_addr"),
+                 (orig_new, counters[1] - seen[1], counters[4] - seen[4]), resp_new),
+                (resp, orig, resp_p, orig_p, native.get("resp_l2_addr"),
+                 (resp_new, counters[3] - seen[3], counters[5] - seen[5]), orig_new)):
+            if packets <= 0:
+                continue
+            src_dotted, src_local = endpoint_of(src)
+            dst_dotted, dst_local = endpoint_of(dst)
+            s_idx = arena_slots(src, dst, now)[0]
+            slot_last_access[s_idx] = now
+            # The sniffer counts whole Ethernet frames; Zeek counts IP bytes.
+            for msg, target, *extra_data in observe_volume(s_idx, src, dst, src_dotted, dst_dotted, src_local,
+                                                           dst_local, sport, dport, proto, mac,
+                                                           max(0, ip_bytes) + 14 * packets, packets, now, span,
+                                                           replies, max(0, payload) if has_payload else None):
+                _emit_alert("ALERT", msg, target=target, data=extra_data[0] if extra_data else None)
+
+    def observe_global(record, current_loop_time):
+        """Cross-device analytics for one event, in capture order: the arena detectors, inventory,
+        baseline, DNS, JA3, beacons and every rate limit. Returns True if an arena detector or a
+        signature alerted (the render row's flag). The single core calls it per event; the merge
+        per shard record."""
+        nonlocal dev_new_sent, dev_new_dropped, intel_cooldown, packet_clock
+        (_, src, dst, src_dotted, dst_dotted, current_time, size, dport, sport, protocol, mac_src, mac_dst,
+         src_local, dst_local, outbound_web, tcp_flags, extra) = record
+        policy_item, beacon_item, dns_item, ja3_item, intel_item, signature_msgs = extra or NO_EXTRA
+        packet_clock = current_time
+        s_idx, d_idx = arena_slots(src, dst, current_loop_time)
         slot_last_access[s_idx] = current_time
         slot_last_access[d_idx] = current_time
         alert_msgs = []  # (message, packed-address the alert is about)
@@ -1496,7 +1684,7 @@ def dod_core_process(
                     log.critical("policy response backlog full; verdict retained in audit ledger")
         if beacon_detector is not None and beacon_item is not None:
             beacon_flow, community_id = beacon_item
-            beacon = beacon_detector.observe(beacon_flow, current_time)
+            beacon = beacon_detector.observe(beacon_flow)
             accepted = (accept_egress("beacon", mac_src, beacon_flow.get("domain"), dst, src_dotted, dst_dotted,
                                       current_time) if beacon is not None else None)
             if accepted is not None:
@@ -1513,13 +1701,9 @@ def dod_core_process(
                     target=dst,
                     data={**beacon, "severity": "alert", "community_id": community_id},
                 )
-        # Inbound QUIC (an external server's UDP/443 to a local client) is a download, not a flood.
-        tunnel = protocol == "UDP" and (sport in tunnel_udp_ports or dport in tunnel_udp_ports)
-        if (protocol == "UDP" and not tunnel and not (sport == 443 and dst_local and not src_local)
-                and not (dst_local and udp_flood_exempt(mac_src, dst, dport))):
-            res = analyze_udp_flood(arena[s_idx], current_time, config, src_dotted)
-            if res and detector_alert_gate.allow("udp", src, current_time):
-                alert_msgs.append((res, src))
+        if not (bulk_shed and bulk_shed_flow(protocol, sport, dport)):  # else its volume comes from Zeek
+            alert_msgs.extend(observe_volume(s_idx, src, dst, src_dotted, dst_dotted, src_local, dst_local, sport,
+                                             dport, protocol, mac_src, size, 1.0, current_time))
         sweep = arena[s_idx]["sweep_state"]
         track_sweep_target(sweep_targets, src, dst_dotted,
                            sweep[1] == 0 or abs(current_time - sweep[0]) > config["SWEEP_WINDOW_SEC"])
@@ -1530,16 +1714,6 @@ def dod_core_process(
             if detector_alert_gate.allow("sweep", src, current_time):
                 alert_msgs.append((res, src, {"target_ips": list(targets),
                                               "distinct_ports": config["SWEEP_THRESHOLD_PORTS"] + 1}))
-        # Exfiltration is a property of the SENDER, and only of traffic
-        # actually leaving the network. Accumulating on the destination row
-        # counted every inbound byte as egress, so any ordinary download
-        # crossing EXFIL_THRESHOLD_BYTES alerted against the local host.
-        if src_local and not dst_local and not tunnel:
-            res = analyze_volumetric_exfil(arena[s_idx], current_time, config, dst_dotted, size)
-            if (res and not exfil_exempt(mac_src, dst, current_time)
-                    and exfil_alert_gate.allow("exfil", (src, dst), current_time)):
-                alert_msgs.append((f"{res} by {src_dotted}", dst))
-
         # [DEVICE INVENTORY] passively record both endpoints' MACs, associating
         # the IP only when it is local (so a remote IP behind the gateway's MAC
         # is not mis-attributed). A first sighting raises a NEW-DEVICE notice.
@@ -1558,11 +1732,6 @@ def dod_core_process(
                         "DEVICE_NEW", f"NEW DEVICE: {dev['mac']} [{dev['vendor']}]{loc}", target="UI_SHELL"
                     )
 
-        # [BASELINE] accumulate a local device's egress bytes for the window.
-        # Egress = the device is the source; only local senders are baselined.
-        if baseline is not None and src_local and is_usable_mac(mac_src):
-            bkey = normalize_mac(mac_src)
-            baseline_bytes[bkey] = baseline_bytes.get(bkey, 0) + size
         if src_local and is_usable_mac(mac_src):
             coverage_active_sources[normalize_mac(mac_src)] = current_time
             if outbound_web:
@@ -1607,13 +1776,38 @@ def dod_core_process(
                 intel_cooldown[hit_target] = current_time
                 _emit_alert("ALERT", hit_msg, target=hit_target)
 
+        # b793: a held GEO-THREAT whose flow was never named in time alerts as it would have at once.
+        # Every hold gets the same delay on the capture-ordered clock, so the oldest entry is due first.
+        while geo_held:
+            key = next(iter(geo_held))
+            deadline, (msg, alert_target, data) = geo_held[key]
+            if current_time < deadline:
+                break
+            del geo_held[key]
+            _emit_alert("ALERT", msg, target=alert_target, data={k: v for k, v in data.items() if k != "geo_hold"})
+
         alert_msgs.extend(signature_msgs)
+        alerted = False
         for msg, alert_target, *extra_data in alert_msgs:
-            if extra_data and extra_data[0].get("accepted"):  # an ACCEPTED_EGRESS info record, never an alert
-                emit_accepted([(msg, alert_target, extra_data[0])])
+            data = extra_data[0] if extra_data else None
+            if data and data.get("geo_named"):  # SNI named the flow and an entry accepted it: drop its hold
+                geo_held.pop((src, dst), None)
                 continue
-            _emit_alert("ALERT", msg, target=alert_target, data=extra_data[0] if extra_data else None)
-        return bool(alert_msgs)
+            if data and data.get("geo_hold"):
+                if (src, dst) not in geo_held and len(geo_held) < 4096:
+                    geo_held[(src, dst)] = (current_time + GEO_NAME_HOLD_SEC, (msg, alert_target, data))
+                    continue
+                if (src, dst) in geo_held:
+                    continue  # already held: the deadline decides
+                data = {k: v for k, v in data.items() if k != "geo_hold"}  # hold table full: alert at once
+            elif msg.startswith("GEO-THREAT"):
+                geo_held.pop((src, dst), None)  # named but not accepted: this alert stands in for the held one
+            alerted = True
+            if data and data.get("accepted"):  # an ACCEPTED_EGRESS info record, never an alert
+                emit_accepted([(msg, alert_target, data)])
+                continue
+            _emit_alert("ALERT", msg, target=alert_target, data=data)
+        return alerted
 
     def forward_records(records, seq):
         """A shard's records for one ingest batch. The merge reads every shard's in lock-step, so none may
@@ -1733,6 +1927,7 @@ def dod_core_process(
                 events_total += len(events)
                 render_events = []
                 web_candidates = []
+                web_ports = HumanWebClassifier.WEB_PORTS if human_web_classifier is not None else ()
 
                 for evt_index, evt_data in enumerate(events):
                     try:
@@ -1748,8 +1943,14 @@ def dod_core_process(
                         # The ledger row comes first: an analyser fault below must not lose the packet's row.
                         # Text form (v4 dotted / v6 colon) derived once from the packed keys;
                         # used for alert messages, geo lookup, DB rows, and render payloads.
-                        src_dotted = ip_str(src)
-                        dst_dotted = ip_str(dst)
+                        try:
+                            src_dotted, src_local = endpoint_cache[src]
+                        except (KeyError, TypeError):
+                            src_dotted, src_local = endpoint_of(src)
+                        try:
+                            dst_dotted, dst_local = endpoint_cache[dst]
+                        except (KeyError, TypeError):
+                            dst_dotted, dst_local = endpoint_of(dst)
 
                         country_code = geo_cache.get(dst_dotted)
                         if country_code is None:
@@ -1788,8 +1989,8 @@ def dod_core_process(
                             )
                         )
 
-                        src_local, dst_local = is_local(src), is_local(dst)
                         flow_snapshot = None
+                        source_port = None
                         web_observation = None
                         policy_decision = policy_item = beacon_item = None
                         direction = (
@@ -1801,6 +2002,9 @@ def dod_core_process(
                             if src_local and dst_local
                             else "any"
                         )
+                        if dst_local and evt_data.get("dns_answers") and evt_data.get("dns_qname"):
+                            for answer in evt_data["dns_answers"]:
+                                learn_name(answer, evt_data["dns_qname"].lower().strip("."), dns=True, device=dst)
                         if flow_tracker is not None:
                             flow_snapshot, flow_created = flow_tracker.observe(
                                 evt_data,
@@ -1808,6 +2012,9 @@ def dod_core_process(
                                 dst_local=dst_local,
                             )
                             direction = flow_snapshot["observation_direction"]
+                            if flow_snapshot["domain"] and not dst_local:
+                                learn_name(dst, flow_snapshot["domain"], device=src)
+                            source_port = int(evt_data.get("source_port") or 0)  # observe() already took this int
                             policy = policy_box[0]
                             policy_key = None
                             if policy is not None:
@@ -1815,13 +2022,15 @@ def dod_core_process(
                                     policy.digest,
                                     flow_snapshot["identity_revision"],
                                 )
-                            flow_policy_state = policy_state.setdefault(flow_snapshot["flow_id"], {})
+                            flow_policy_state = policy_state.get(flow_snapshot["flow_id"])
+                            if flow_policy_state is None:
+                                flow_policy_state = policy_state[flow_snapshot["flow_id"]] = {}
                             if policy is not None and flow_policy_state.get(direction) != policy_key:
                                 context = {
                                     **flow_snapshot,
                                     "src_ip": src,
                                     "dst_ip": dst,
-                                    "source_port": int(evt_data.get("source_port") or 0),
+                                    "source_port": source_port,
                                     "destination_port": int(evt_data.get("port") or 0),
                                     "source_mac": str(evt_data.get("mac_src") or ""),
                                     "direction": direction,
@@ -1863,27 +2072,29 @@ def dod_core_process(
                                         policy_decision["configured_action"] == "block"
                                         and policy_decision["mode"] in {"manual", "enforce"},
                                     )
-                            if beacon_wanted and flow_snapshot["first_local_egress"]:
+                            if beacon_wanted and flow_snapshot["beacon_sample_at"] is not None:
                                 beacon_item = ({
                                     **flow_snapshot,
+                                    "domain": flow_snapshot["domain"] or learned_names.get(dst, ""),
+                                    "domains": tuple(learned_names.recent.get((src, dst), ())),
                                     "src_ip": src,
                                     "dst_ip": dst,
-                                    "source_port": int(evt_data.get("source_port") or 0),
+                                    "source_port": source_port,
                                     "destination_port": int(evt_data.get("port") or 0),
                                     "src_local": True,
                                     "dst_local": False,
-                                    "first_seen": current_time,
+                                    "first_seen": flow_snapshot["beacon_sample_at"],
                                     "source_mac": str(evt_data.get("mac_src") or ""),
                                 }, detection_community_id(evt_data, src, dst))
 
                         dns_item = ((evt_data.get("dns_qname"), evt_data["dns_qr"], evt_data.get("dns_rcode"),
                                      evt_data.get("dns_qtype")) if evt_data.get("dns_qr") is not None else None)
-                        fingerprints = tuple((fp_hash, fp_kind) for fp_hash, fp_kind in (
-                            (evt_data.get("ja3"), "ja3"),
-                            (evt_data.get("ja3s"), "ja3s"),
-                            (evt_data.get("ja4"), "ja4"),
-                        ) if fp_hash)
-                        ja3_item = (evt_data["sni_domain"], fingerprints) if fingerprints else None
+                        ja3_item = None
+                        ja3, ja3s, ja4 = evt_data.get("ja3"), evt_data.get("ja3s"), evt_data.get("ja4")
+                        if ja3 or ja3s or ja4:
+                            ja3_item = (evt_data["sni_domain"], tuple(
+                                (fp_hash, fp_kind) for fp_hash, fp_kind in ((ja3, "ja3"), (ja3s, "ja3s"), (ja4, "ja4"))
+                                if fp_hash))
 
                         # [THREAT INTEL] match endpoints/domain against the loaded blocklists. An
                         # IP hit targets the bad EXTERNAL ip (so mitigation can block it); emitted
@@ -1896,11 +2107,11 @@ def dod_core_process(
                         intel_item = None
                         if intel is not None:
                             hit_msg, hit_target = None, src
-                            if not dst_local and is_global_ip(dst) and (dst_hit := intel.match_ip(dst)):
+                            if not dst_local and (dst_hit := intel_hit(intel, dst, False)):
                                 hit_msg, hit_target = f"THREAT INTEL: egress to {dst_dotted} on {dst_hit} blocklist", dst
-                            elif not src_local and is_global_ip(src) and (src_hit := intel.match_ip(src)):
+                            elif not src_local and (src_hit := intel_hit(intel, src, False)):
                                 hit_msg = f"THREAT INTEL: traffic from {src_dotted} on {src_hit} blocklist"
-                            elif dom_hit := intel.match_domain(evt_data["sni_domain"]):
+                            elif dom_hit := intel_hit(intel, evt_data["sni_domain"], True):
                                 # target the LAN source: dst is a resolver or shared CDN IP, not the offender
                                 hit_msg = f"THREAT INTEL: {evt_data['sni_domain']} on {dom_hit} blocklist"
                             if hit_msg:
@@ -1912,15 +2123,17 @@ def dod_core_process(
                             signature_msgs.append(
                                 (f"THREAT DOMAIN: {src_dotted} -> {evt_data['sni_domain']}", _external_of(src, dst))
                             )
-                        # A known scanner (the dev host's own LAN sweep) touching LAN telnet/RDP/FTP is the sweep itself.
-                        if dport in threat_ports and not (src in sweep_ignored and dst_local):
+                        # A known scanner (the console host's own LAN sweep) touching LAN telnet/RDP/FTP is the sweep itself.
+                        # A parsed DNS answer to a client that drew 3389 or 23 as its ephemeral port is not an access.
+                        if (dport in threat_ports and not (src in sweep_ignored and dst_local)
+                                and evt_data.get("dns_qr") != 1):
                             signature_msgs.append((f"THREAT PORT: Restricted port {dport} accessed", _external_of(src, dst)))
                         if country_code in threat_countries:
                             signature_msgs.append((f"GEO-THREAT: Egress to {country_code} from {src_dotted} ({evt_data['mac_src']})",
                                                    dst, {"src_ip": src_dotted, "src_mac": evt_data["mac_src"]}))
 
                         outbound_web = (
-                            (src_local and not dst_local and (protocol, dport) in HumanWebClassifier.WEB_PORTS)
+                            (src_local and not dst_local and (protocol, dport) in web_ports)
                             if human_web_classifier is not None
                             else False
                         )
@@ -1930,19 +2143,29 @@ def dod_core_process(
                             mac_text = str(evt_data.get("mac_src") or "")
                             kinds = (("threat-intel", intel_item is not None), ("egress-country", country_code in threat_countries))
                             for kind, hit in kinds:
-                                if hit and (acc := accept_egress(kind, mac_text, evt_data["sni_domain"], dst,
+                                named = (evt_data["sni_domain"] if evt_data["sni_domain"] != "encrypted-payload"
+                                         else learned_names.get(dst, ""))
+                                if hit and (acc := accept_egress(kind, mac_text, named, dst,
                                                                  src_dotted, dst_dotted, current_time)) is not None:
                                     accepted.extend(acc)
                                     if kind == "threat-intel":
                                         intel_item = None
                                     else:
                                         signature_msgs = [m for m in signature_msgs if not m[0].startswith("GEO-THREAT")]
+                                        accepted.append(("", dst_dotted, {"geo_named": True}))  # releases a b793 hold
+                            # b793: no name yet on a 443 flow from a device with a domain entry: let the merge hold it.
+                            if (country_code in threat_countries and not named and mac_text.lower() in domain_rule_macs
+                                    and dport == 443 and protocol in ("TCP", "UDP")):
+                                for m in signature_msgs:
+                                    if m[0].startswith("GEO-THREAT"):
+                                        m[2]["geo_hold"] = True
                         signature_msgs.extend(accepted)
                         extra = (policy_item, beacon_item, dns_item, ja3_item, intel_item, signature_msgs)
                         record = (
                             evt_index if index is None else index[evt_index],
                             src, dst, src_dotted, dst_dotted, current_time, size, dport,
-                            int(evt_data.get("source_port") or 0), protocol, evt_data["mac_src"], evt_data["mac_dst"],
+                            int(evt_data.get("source_port") or 0) if source_port is None else source_port, protocol,
+                            evt_data["mac_src"], evt_data["mac_dst"],
                             src_local, dst_local, outbound_web,
                             evt_data.get("tcp_flags") if protocol == "TCP" else None,
                             extra if any(extra) else None,
@@ -1954,11 +2177,9 @@ def dod_core_process(
                             alerted = bool(signature_msgs)
 
                         ttl = evt_data.get("ttl", 0)
-                        os_guess = ttl_profile(
-                            ttl,
-                            config["OS_THRESHOLD_NIX"],
-                            config["OS_THRESHOLD_WIN"],
-                        )
+                        os_guess = ttl_guesses.get(ttl) if type(ttl) is int else None
+                        if os_guess is None:
+                            os_guess = ttl_profile(ttl, config["OS_THRESHOLD_NIX"], config["OS_THRESHOLD_WIN"])
 
                         render_data = {
                             "event_id": event_id,
@@ -1980,26 +2201,19 @@ def dod_core_process(
                             "is_lan_to_lan": src_local and dst_local,
                             "direction": direction,
                             "flow_id": flow_snapshot.get("flow_id") if flow_snapshot else "",
-                            "ja4": evt_data.get("ja4"),
+                            "ja4": ja4,
                             "web_observation": web_observation,
+                            "source_port": evt_data.get("source_port"),
+                            "sensor_id": evt_data.get("sensor_id"),
+                            "vlan_ids": evt_data.get("vlan_ids"),
+                            "ip_protocol": evt_data.get("ip_protocol"),
+                            "fragmented": evt_data.get("fragmented"),
+                            "non_initial_fragment": evt_data.get("non_initial_fragment"),
+                            "icmp_type": evt_data.get("icmp_type"),
+                            "icmp_code": evt_data.get("icmp_code"),
+                            "capture_interface": evt_data.get("interface"),
+                            "event_version": 2,
                         }
-                        render_data.update(
-                            {
-                                key: evt_data.get(key)
-                                for key in (
-                                    "source_port",
-                                    "sensor_id",
-                                    "vlan_ids",
-                                    "ip_protocol",
-                                    "fragmented",
-                                    "non_initial_fragment",
-                                    "icmp_type",
-                                    "icmp_code",
-                                )
-                            }
-                        )
-                        render_data["capture_interface"] = evt_data.get("interface")
-                        render_data["event_version"] = 2
                         render_events.append(render_data)
                         if human_web_classifier is not None and flow_snapshot is not None:
                             dns_query = src_local and evt_data.get("dns_qr") == 0
@@ -2009,7 +2223,10 @@ def dod_core_process(
                                 or int(flow_snapshot.get("packets_up") or 0) >= 3
                                 or int(flow_snapshot.get("packets_down") or 0) >= 1
                             )
-                            if dns_query or (outbound_web and web_phase):
+                            # A scored flow's later non-DNS packets: observe() returns None and changes nothing.
+                            if dns_query or (outbound_web and web_phase and (
+                                    evt_data.get("dns_qr") is not None
+                                    or flow_snapshot["flow_id"] not in human_web_classifier.emitted)):
                                 web_candidates.append(
                                     (
                                         len(render_events) - 1,
@@ -2063,7 +2280,7 @@ def dod_core_process(
                         del observation_batch[:overflow]
                         CoreMetrics.dropped_web_observations += overflow
 
-                if render_events:
+                if render_events and render_rows:
                     r_msg = make_message(
                         "DOD_CORE",
                         "RENDER_BATCH",
@@ -2191,6 +2408,9 @@ def dod_core_process(
             except Exception as exc:
                 log.warning("policy reload rejected; retaining last-known-good policy: %s: %s", type(exc).__name__, exc)
 
+        if current_loop_time - last_names_save >= 60:
+            learned_names.save()
+            last_names_save = current_loop_time
         # Periodically flush new devices and last-seen/IP/count updates (observe()
         # never writes). Cheap no-op if clean.
         if inventory is not None and current_loop_time - last_dev_save >= dev_save_interval:
@@ -2211,6 +2431,25 @@ def dod_core_process(
             try_put_drop_oldest(inventory_queue, make_message(
                 "DOD_CORE", "INVENTORY_SNAPSHOT", "DURABLE_ANALYSIS", {"devices": inventory.snapshot()}))
             last_dev_save = current_loop_time
+
+        if bulk_shed and current_loop_time - last_zeek_poll >= 1.0:
+            last_zeek_poll = current_loop_time
+            try:
+                while True:
+                    rows, scanned_to = security_store.source_stream_page("ZEEK", ("conn", "conn_interim"),
+                                                                         zeek_cursor, 1000)
+                    for row in rows:
+                        try:
+                            # shortcut: an idle mirror leaves packet_clock stale; Zeek sees the same mirror, so few rows.
+                            observe_zeek_conn(row["native"], row["event_type"] == "conn_interim",
+                                              current_loop_time if packet_clock is None else packet_clock)
+                        except Exception:
+                            CoreMetrics.event_faults += 1  # one malformed record must not stall the stream
+                    if scanned_to == zeek_cursor:
+                        break
+                    zeek_cursor = scanned_to
+            except Exception as e:
+                log.error("zeek volume read failed: %s: %s", type(e).__name__, e)
 
         # [BASELINE] close the window: score each device's egress total against its
         # learned norm, emit a notice on an upward deviation, then reset + persist.
@@ -2335,7 +2574,8 @@ def dod_core_process(
             run_round([pending.pop(0) if pending else None for pending in leftovers], time.time())
 
     # Shutdown: flush every ledger so a clean exit never loses accumulated state.
-    for name, component in (("inventory", inventory), ("baseline", baseline), ("dns", dns_analyzer), ("ja3", ja3watch)):
+    for name, component in (("inventory", inventory), ("baseline", baseline), ("dns", dns_analyzer), ("ja3", ja3watch),
+                            ("learned_names", learned_names)):
         if component is None:
             continue
         try:

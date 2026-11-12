@@ -22,8 +22,10 @@ from netwatch_security_store import _encode
 CURSOR_PREFIX = "ANALYSIS:ASSETS:v1:"
 HEALTH_KEY = "ANALYSIS:ASSETS:v1"
 STREAMS = (("CONTROL", "dhcp"), ("CONTROL", "arp"), ("CONTROL", "ipv6_na"), ("CONTROL", "ipv6_ns"),
-           ("SURICATA", "http"), ("SURICATA", "tls"))
+           ("ZEEK", "dhcp"), ("ZEEK", "known_hosts"), ("ZEEK", "known_services"), ("ZEEK", "software"),
+           ("ZEEK", "conn"), ("SURICATA", "http"), ("SURICATA", "tls"))
 ANCHORS = ("mac", "dhcp_client_id")
+ROUTER_WINDOW_SEC = 86400.0  # a host whose prefix or lease moved earlier is not a router now (b231)
 EVIDENCE_REFS = 8  # first plus most recent native references per row
 NEW_SERVICE_AFTER_SEC = 86400
 READ_LIMIT = 500
@@ -42,6 +44,18 @@ def _refs(existing, ref):
     if ref and ref not in refs:
         refs.append(ref)
     return refs[:1] + refs[1:][-(EVIDENCE_REFS - 1):]
+
+
+def _network(ip):
+    """The on-link network an address implies: its /64, or its /24 for IPv4."""
+    return ipaddress.ip_network(f"{ip}/{64 if ':' in ip else 24}", strict=False)
+
+
+def _counted(ip):
+    """Whether an address names a network for the router test: every IPv6 host also holds a
+    link-local and often a ULA address beside its global one, so only global IPv6 counts."""
+    addr = ipaddress.ip_address(ip)
+    return addr.version == 4 or not (addr.is_link_local or addr.is_private)
 
 
 def _merge(body, ref, source, **lists):
@@ -112,6 +126,7 @@ class DurableAssetAnalyzer:
         networks = (*config.get("LOCAL_PREFIXES", ()), *config.get("LOCAL_PREFIXES6", ()))
         self.v4, self.v6 = compile_v4_prefixes(networks), compile_v6_prefixes(networks)
         self.ignored_macs = {normalize_mac(config.get("QUARANTINE_SINK_MAC", "02:00:00:00:de:ad"))}
+        self.gateway_mac = normalize_mac(config.get("GATEWAY_MAC") or "")
         self.last_error = None
         self.skipped = 0
         self._inventory_seen = {}  # mac -> last_seen already recorded
@@ -185,11 +200,61 @@ class DurableAssetAnalyzer:
             self._claims.pop(next(iter(self._claims)))
         return None
 
+    def _absorb(self, orphan, asset_id, ip, t):
+        """Fold an address-only asset whose sole identity is ``ip`` into the anchored asset now
+        binding it, history and findings included; anything with more identity stays separate (b231)."""
+        conn = self.store.conn
+        idents = conn.execute("SELECT DISTINCT kind, value FROM security_asset_identities WHERE asset_id=?",
+                              (orphan,)).fetchall()
+        if any(row["kind"] != "ip" or row["value"] != ip for row in idents):
+            return False
+        conn.execute("UPDATE security_asset_identities SET asset_id=? WHERE asset_id=?", (asset_id, orphan))
+        for table, key in (("security_asset_services", "protocol, port"), ("security_asset_software", "name, version")):
+            conn.execute(f"""INSERT INTO {table} SELECT ?, {key}, first_seen, last_seen, body FROM {table}
+                WHERE asset_id=? ON CONFLICT DO UPDATE SET first_seen=min(first_seen, excluded.first_seen),
+                last_seen=max(last_seen, excluded.last_seen)""", (asset_id, orphan))
+            conn.execute(f"DELETE FROM {table} WHERE asset_id=?", (orphan,))
+        for row in conn.execute("SELECT * FROM security_exposure_findings WHERE asset_id=?", (orphan,)).fetchall():
+            body = json.loads(row["body"])
+            fid = hashlib.sha256(_encode(["service", asset_id, body["protocol"], body["port"]]).encode()).hexdigest()[:32]
+            body.update(finding_id=fid, asset_id=asset_id)
+            conn.execute("""INSERT INTO security_exposure_findings VALUES (?,?,?,?,?,?,?) ON CONFLICT(finding_id)
+                DO UPDATE SET first_seen=min(first_seen, excluded.first_seen), last_seen=max(last_seen, excluded.last_seen),
+                observations=observations+excluded.observations""",
+                         (fid, asset_id, row["score"], row["first_seen"], row["last_seen"], row["observations"],
+                          _encode(body)))
+        conn.execute("DELETE FROM security_exposure_findings WHERE asset_id=?", (orphan,))
+        first = conn.execute("SELECT first_seen FROM security_assets WHERE asset_id=?", (orphan,)).fetchone()
+        conn.execute("UPDATE security_assets SET first_seen=min(first_seen, ?) WHERE asset_id=?",
+                     (first["first_seen"], asset_id))
+        conn.execute("DELETE FROM security_assets WHERE asset_id=?", (orphan,))
+        conn.execute("INSERT INTO security_native_audit(timestamp,actor,operation,body) VALUES (?,?,?,?)",
+                     (t, "asset-analyzer", "asset_absorbed", _encode({"absorbed": orphan, "into": asset_id, "ip": ip})))
+        return True
+
+    def _l2_ip(self, t, mac, ip, peer_ip):
+        """``ip`` when a Zeek conn's L2 address can be that end's own MAC: on-link, not the gateway,
+        not a router carrying several local networks, and not across two local networks (b231)."""
+        mac, ip = self._mac(mac), self._local(ip)
+        if not (mac and ip) or mac == self.gateway_mac:
+            return None
+        peer = self._local(peer_ip)
+        if peer and _network(peer) != _network(ip):  # routed between local networks: frames carry the router's MAC
+            return None
+        held = self.store.conn.execute("""SELECT DISTINCT i.value FROM security_asset_identities i
+            JOIN security_asset_identities m ON m.asset_id=i.asset_id AND m.kind='mac' AND m.value=?
+            WHERE i.kind='ip' AND i.last_seen >= ?""", (mac, t - ROUTER_WINDOW_SEC)).fetchall()
+        nets = {_network(value) for value in (*(row["value"] for row in held), ip) if _counted(value)}
+        if len({net for net in nets if net.version == 4}) > 1 or len({net for net in nets if net.version == 6}) > 1:
+            return None  # a MAC already carrying another local network of a family is a router
+        return self._arp_ip(t, mac, ip)
+
     def observe(self, t, source, ref, *, mac=None, client_id=None, hostname=None, ip=None, vendor=None):
         """Resolve one identity observation to an asset; only MAC/client-id anchors identity.
 
         An address alone never joins an anchored asset: an unknown address gets an
-        address-only asset, and later anchored evidence for it opens a new interval.
+        address-only asset. Later anchored evidence for it absorbs that asset when the address
+        is its only identity, and otherwise opens a new interval.
         """
         mac, ip, hostname = self._mac(mac), self._local(ip) if ip else None, _text(hostname)
         client_id = _text(client_id)
@@ -206,6 +271,10 @@ class DurableAssetAnalyzer:
                 break
         if asset_id is None and not anchors:
             asset_id = self._holder(ip, t)
+        elif asset_id is not None and ip:
+            orphan = self._holder(ip, t)
+            if orphan not in (None, asset_id):
+                self._absorb(orphan, asset_id, ip, t)
         if asset_id is None:
             asset_id = uuid.uuid4().hex
             body = {"identity": anchors[0][0] if anchors else "address-only",
@@ -304,6 +373,39 @@ class DurableAssetAnalyzer:
             mac = n.get("mac_src")
             if target and self._mac(mac):
                 self.observe(t, "CONTROL", ref, mac=mac, ip=self._arp_ip(t, mac, target))
+        elif source == "ZEEK":
+            if event_type == "dhcp":
+                self.observe(t, "ZEEK", ref, mac=native.get("mac"), hostname=native.get("host_name"),
+                             ip=native.get("assigned_addr"))
+            elif event_type == "known_hosts":
+                self.observe(t, "ZEEK", ref, ip=native.get("host"))
+            elif event_type == "known_services":
+                names = native.get("service") or []
+                self._service(native.get("host"), t, "ZEEK", ref, native.get("port_proto"), native.get("port_num"),
+                              names=names if isinstance(names, list) else [names])
+            elif event_type == "software":
+                # Zeek JSON flattens the version record into dotted keys.
+                version = native.get("unparsed_version") or ".".join(
+                    str(native[f"version.{k}"]) for k in ("major", "minor", "minor2", "minor3")
+                    if native.get(f"version.{k}") is not None)
+                self._software(native.get("host"), t, "ZEEK", ref, native.get("name"), version,
+                               kind=native.get("software_type"), port=native.get("host_p"))
+            elif event_type == "conn":
+                # Zeek's L2 addresses bind each local end to its MAC, so a rotating IPv6 temporary
+                # address joins its device even when the mirror never saw that device's NDP (b231).
+                for side, other in (("orig", "resp"), ("resp", "orig")):
+                    ip = self._l2_ip(t, native.get(f"{side}_l2_addr"), native.get(f"id.{side}_h"),
+                                     native.get(f"id.{other}_h"))
+                    if ip:
+                        self.observe(t, "ZEEK", ref, mac=native.get(f"{side}_l2_addr"), ip=ip)
+                history = str(native.get("history") or "")
+                # Only a responder SYN-ACK to an originator SYN proves the local host answered.
+                if native.get("proto") == "tcp" and "S" in history and "h" in history and \
+                        self._local(native.get("id.resp_h")):
+                    peer = "lan" if self._local(native.get("id.orig_h")) else "external"
+                    names = [native["service"]] if native.get("service") else []
+                    self._service(native.get("id.resp_h"), t, "ZEEK", ref, "tcp", native.get("id.resp_p"),
+                                  names=names, peer=peer)
         elif source == "SURICATA" and self._local(native.get("dest_ip")):
             # App-layer metadata on a local destination means the local server answered.
             peer = "lan" if self._local(native.get("src_ip")) else "external"
@@ -381,6 +483,14 @@ def node_name(nodes, mac, ip):
         elif ip and ip in (node.get("ips") or ()):
             return name
     return None
+
+
+def named_nodes(config):
+    """SECURE_NODES plus DEVICE_NAMES as one name lookup for asset views; a secure node's name wins."""
+    nodes = dict(config.get("SECURE_NODES") or {})  # first: node_name returns the first match
+    for mac, name in (config.get("DEVICE_NAMES") or {}).items():
+        nodes.setdefault(name, {"macs": [mac]})
+    return nodes
 
 
 def list_assets(store, limit=None, nodes=None):
@@ -471,8 +581,8 @@ RECORD_SCAN = 5000
 
 
 def record_ips(normalized):
-    """Addresses a source record can be pivoted by: its endpoints."""
-    return [normalized.get(key) for key in ("src_ip", "dst_ip")]
+    """Addresses a source record can be pivoted by: its endpoints and, for Wazuh, the agent's address."""
+    return [normalized.get(key) for key in ("src_ip", "dst_ip")] + [(normalized.get("agent") or {}).get("address")]
 
 
 class AssetResolver:

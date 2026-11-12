@@ -1,7 +1,7 @@
 """Run monitoring without a graphical session: python -m netwatch_service."""
 
 import argparse
-import multiprocessing as mp
+import fcntl
 import os
 import signal
 import sqlite3
@@ -22,7 +22,6 @@ from netwatch_security_store import security_db_path, sqlite_wal_safe
 
 # Close-path allowance past the drain budget; grace 60 + 20 stays under the unit's TimeoutStopSec=90.
 STOP_CLOSE_SEC = 20
-STOP_FILE = "netwatch.stop"
 
 
 @contextmanager
@@ -33,32 +32,15 @@ def service_lock(path):
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     locked = False
     try:
-        if os.name == "nt":
-            import msvcrt
-
-            if os.fstat(descriptor).st_size == 0:
-                os.write(descriptor, b"0")
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            try:
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise RuntimeError("monitoring service already owns this ledger") from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                raise RuntimeError("monitoring service already owns this ledger") from exc
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError("monitoring service already owns this ledger") from exc
         locked = True
         yield
     finally:
         if locked:
-            if os.name == "nt":
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -109,10 +91,6 @@ def main(argv=None):
     for name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), request_stop)
-    # Task Scheduler's End is TerminateProcess, which no handler sees: on Windows an ordered
-    # stop is asked for by creating this file (see the README's headless service section). A stale one must not stop a start.
-    stop_file = base / STOP_FILE
-    stop_file.unlink(missing_ok=True)
     # Supervisor and API run without effective raw-socket privilege; permitted/ambient
     # stay only so a restarted capture worker inherits them (see packaging/linux).
     drop_effective_privileges()
@@ -138,10 +116,6 @@ def main(argv=None):
                         log.warning("supervisor tick deferred: %s at %s", exc, " <- ".join(
                             f"{os.path.basename(f.filename)}:{f.lineno} {f.name}"
                             for f in reversed(traceback.extract_tb(exc.__traceback__)[-3:])))
-                    if stop_file.exists():
-                        log.info("stop requested by %s", stop_file)
-                        stop_file.unlink(missing_ok=True)
-                        request_stop()
                     stop.wait(0.2)
             finally:
                 if api is not None:
@@ -157,5 +131,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     raise SystemExit(main())

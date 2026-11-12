@@ -3,7 +3,7 @@
 Fetches public blocklists and writes a consolidated local cache
 (``threatintel_cache.json``) that the monitor reads. This is the ONLY component
 that makes outbound connections — the monitor itself stays passive and just reads
-the cache. Run it on a schedule (Windows Task Scheduler / cron), like updating AV
+the cache. Run it on a schedule (a systemd timer or cron), like updating AV
 signatures.
 
     python threatintel_update.py update     # fetch feeds, rebuild the cache

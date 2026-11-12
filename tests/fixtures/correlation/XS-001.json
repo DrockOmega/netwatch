@@ -1,0 +1,15 @@
+{
+  "rule": "XS-001",
+  "local_networks": ["192.168.1.0/24"],
+  "attack_demonstrated": [],
+  "detections": [
+    {"source": "SURICATA", "action": "SURICATA_ALERT", "target_id": "203.0.113.9", "offset_sec": 0,
+     "data": {"source_event_id": "eve-1", "message": "SURICATA ALLOWED: ET POLICY curl user agent", "severity": "alert",
+              "src_ip": "192.168.1.20", "src_port": 51000, "dst_ip": "203.0.113.9", "dst_port": 80,
+              "direction": "egress", "community_id": "1:LQU9qZlK+B5F3KDmev6m5PMibrg="}},
+    {"source": "ZEEK", "action": "ZEEK_NOTICE", "target_id": "203.0.113.9", "offset_sec": 30,
+     "data": {"source_event_id": "zeek-1", "message": "ZEEK NOTICE: HTTP::Suspicious_UA", "severity": "alert",
+              "src_ip": "192.168.1.20", "src_port": 51000, "dst_ip": "203.0.113.9", "dst_port": 80,
+              "direction": "egress", "community_id": "1:LQU9qZlK+B5F3KDmev6m5PMibrg="}}
+  ]
+}

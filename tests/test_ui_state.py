@@ -343,7 +343,7 @@ def test_load_recent_traffic_events_reconstructs_direction_and_activity(tmp_path
                 ),
                 (
                     "lateral-v6", 10.0, "src6", "dst6",
-                    "2001:db8:82:ba80::10", "2001:db8:82:ba80::20",
+                    "2601:db8:82:ba80::10", "2601:db8:82:ba80::20",
                     "UDP", 5353, "", 255, 200, "", "--", 2,
                 ),
             ],
@@ -355,7 +355,7 @@ def test_load_recent_traffic_events_reconstructs_direction_and_activity(tmp_path
     events = load_recent_traffic_events(
         str(db_path),
         local_prefixes=("10.",),
-        local_prefixes6=("2001:db8:82:ba80::/64",),
+        local_prefixes6=("2601:db8:82:ba80::/64",),
     )
     rows = filter_traffic_events(events)
 
