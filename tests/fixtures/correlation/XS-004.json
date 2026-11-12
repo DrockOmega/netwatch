@@ -1,0 +1,12 @@
+{
+  "rule": "XS-004",
+  "local_networks": ["192.168.1.0/24"],
+  "attack_demonstrated": [],
+  "detections": [
+    {"source": "DOD_CORE", "action": "ALERT", "target_id": "192.168.1.30", "offset_sec": 0,
+     "data": {"source_event_id": "core-udp-1", "message": "UDP_FLOOD: 192.168.1.30 sent 12000 datagrams"}},
+    {"source": "SURICATA", "action": "SURICATA_ALERT", "target_id": "198.51.100.7", "offset_sec": 300,
+     "data": {"source_event_id": "eve-4", "message": "SURICATA ALLOWED: ET SCAN outbound address scan", "severity": "alert",
+              "src_ip": "192.168.1.30", "dst_ip": "198.51.100.7", "direction": "egress"}}
+  ]
+}

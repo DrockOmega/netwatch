@@ -1,0 +1,15 @@
+# Always-on console-host gateway between the NetWatch console and every sensor tunnel.
+# A user unit: it starts at boot only with linger on (loginctl enable-linger <user>).
+# network-online.target does not exist in the user manager, so ordering on it did nothing;
+# Restart= covers a network that is not up yet.
+[Unit]
+Description=NetWatch console gateway
+
+[Service]
+WorkingDirectory=%h/dev/netmon
+ExecStart=%h/dev/netmon/.venv/bin/python netwatch_gateway.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

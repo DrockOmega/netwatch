@@ -1,0 +1,4 @@
+{
+  "_comment": "Known-bad JA3/JA3S MD5 fingerprints (lowercase hex). NetWatch raises a critical alert when any captured TLS handshake matches one of these. Populate from a JA3 threat-intel feed such as abuse.ch SSLBL (roadmap #6: live threat-intel ingestion). Empty by default so there are no false positives out of the box.",
+  "blocklist": []
+}

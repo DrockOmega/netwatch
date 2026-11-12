@@ -1,0 +1,15 @@
+{
+  "rule": "XS-002",
+  "local_networks": ["192.168.1.0/24"],
+  "attack_demonstrated": [],
+  "detections": [
+    {"source": "DOD_CORE", "action": "BEACON_ANOMALY", "target_id": "198.51.100.40", "offset_sec": 0,
+     "data": {"source_event_id": "core-beacon-1", "message": "BEACONING: 192.168.1.21 -> 198.51.100.40:443 every 60.0s",
+              "severity": "alert", "port": 443, "period_sec": 60.0,
+              "community_id": "1:9j2Dzwrw7T9E+IZi4b4IVT66HBI="}},
+    {"source": "SURICATA", "action": "SURICATA_ALERT", "target_id": "198.51.100.40", "offset_sec": 120,
+     "data": {"source_event_id": "eve-2", "message": "SURICATA ALLOWED: ET MALWARE periodic check-in", "severity": "alert",
+              "src_ip": "192.168.1.21", "src_port": 50111, "dst_ip": "198.51.100.40", "dst_port": 443,
+              "direction": "egress", "community_id": "1:9j2Dzwrw7T9E+IZi4b4IVT66HBI="}}
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "note": "MITRE ATT&CK Enterprise IDs are metadata. Every entry is demonstrated:false until a lab test proves the detection fires on the technique.",
+  "techniques": {
+    "T1046": {"name": "Network Service Discovery", "tactic": "Discovery"},
+    "T1071": {"name": "Application Layer Protocol", "tactic": "Command and Control"},
+    "T1071.004": {"name": "Application Layer Protocol: DNS", "tactic": "Command and Control"},
+    "T1568.002": {"name": "Dynamic Resolution: Domain Generation Algorithms", "tactic": "Command and Control"},
+    "T1572": {"name": "Protocol Tunneling", "tactic": "Command and Control"},
+    "T1573": {"name": "Encrypted Channel", "tactic": "Command and Control"},
+    "T1041": {"name": "Exfiltration Over C2 Channel", "tactic": "Exfiltration"},
+    "T1048": {"name": "Exfiltration Over Alternative Protocol", "tactic": "Exfiltration"},
+    "T1557.002": {"name": "Adversary-in-the-Middle: ARP Cache Poisoning", "tactic": "Credential Access"},
+    "T1498": {"name": "Network Denial of Service", "tactic": "Impact"},
+    "T1200": {"name": "Hardware Additions", "tactic": "Initial Access"}
+  },
+  "kinds": [
+    {"kind": "PORT_SWEEP", "action": "ALERT", "prefix": "PORT SCAN", "techniques": ["T1046"], "demonstrated": false},
+    {"kind": "UDP_FLOOD", "action": "ALERT", "prefix": "UDP FLOOD", "techniques": ["T1498"], "demonstrated": false},
+    {"kind": "EXFIL", "action": "ALERT", "prefix": "EXFIL", "techniques": ["T1048", "T1041"], "demonstrated": false},
+    {"kind": "THREAT_INTEL", "action": "ALERT", "prefix": "THREAT INTEL", "techniques": ["T1071"], "demonstrated": false},
+    {"kind": "THREAT_DOMAIN", "action": "ALERT", "prefix": "THREAT DOMAIN", "techniques": ["T1071"], "demonstrated": false},
+    {"kind": "GEO_THREAT", "action": "ALERT", "prefix": "GEO-THREAT", "techniques": ["T1071"], "demonstrated": false},
+    {"kind": "THREAT_PORT", "action": "ALERT", "prefix": "THREAT PORT", "techniques": [], "demonstrated": false},
+    {"kind": "DNS_DGA", "action": "DNS_ANOMALY", "prefix": "DNS DGA", "techniques": ["T1568.002"], "demonstrated": false},
+    {"kind": "DNS_NXDOMAIN_BURST", "action": "DNS_ANOMALY", "prefix": "DNS NXDOMAIN", "techniques": ["T1568.002"], "demonstrated": false},
+    {"kind": "DNS_TUNNEL", "action": "DNS_ANOMALY", "prefix": "DNS TUNNEL", "techniques": ["T1071.004", "T1572"], "demonstrated": false},
+    {"kind": "BEACONING", "action": "BEACON_ANOMALY", "techniques": ["T1071"], "demonstrated": false},
+    {"kind": "JA3_BLOCKLIST", "action": "JA3_ANOMALY", "techniques": ["T1573"], "demonstrated": false},
+    {"kind": "ARP_SPOOF", "action": "ARP_ANOMALY", "techniques": ["T1557.002"], "demonstrated": false},
+    {"kind": "BASELINE_DEVIATION", "action": "BASELINE_ANOMALY", "techniques": ["T1048"], "demonstrated": false},
+    {"kind": "NEW_DEVICE", "action": "DEVICE_NEW", "techniques": ["T1200"], "demonstrated": false},
+    {"kind": "WIRELESS_NEW_DEVICE", "action": "WIRELESS_DEVICE_NEW", "techniques": ["T1200"], "demonstrated": false},
+    {"kind": "SURICATA", "action": "SURICATA_ALERT", "techniques": [], "demonstrated": false},
+    {"kind": "POLICY", "action": "POLICY_DECISION", "techniques": [], "demonstrated": false}
+  ],
+  "none": [
+    "ACCEPTED_EGRESS", "ACCEPTED_EGRESS_EXPIRED", "WIRELESS_DEVICE_QUIET", "WIRELESS_AP_MODE",
+    "CAPTURE_LOSS", "CAPTURE_RECOVERED", "RUNTIME_COLLECTION_GAP", "RUNTIME_START_FAILED",
+    "SPOOL_COLLECTION_GAP", "CONTROL_COLLECTION_GAP", "CONTROL_REVIEW", "SOURCE_COLLECTION_ERROR",
+    "DB_WRITE_FAILURE", "DB_BACKPRESSURE", "ARENA_CAPACITY", "ARENA_EVICTION_ACTIVE",
+    "SIGNATURE_UPDATE_FAILED", "SIGNATURE_UPDATE_RECOVERED", "POLICY_LOAD_FAILED",
+    "POLICY_UPDATE_RECOVERED", "EVIDENCE_SAVED", "EVIDENCE_FAILED"
+  ]
+}

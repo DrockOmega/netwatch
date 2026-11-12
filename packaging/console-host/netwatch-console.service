@@ -1,0 +1,15 @@
+# NetWatch Console window on the console host. Opens at login (graphical session) and whenever the gateway
+# starts during a session; at boot the gateway starts before any display, so Requisite skips it then.
+# Restart=no: closing the window keeps it closed until NetWatch is started again.
+[Unit]
+Description=NetWatch Console
+Wants=netwatch-gateway.service
+Requisite=graphical-session.target
+After=netwatch-gateway.service graphical-session.target
+
+[Service]
+ExecStart=%h/dev/netmon/console/src-tauri/target/release/netwatch-console
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target netwatch-gateway.service

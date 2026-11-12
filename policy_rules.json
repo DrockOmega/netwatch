@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "default_action": "allow",
+  "rules": [
+    {
+      "id": "block-cleartext-telnet-egress",
+      "enabled": false,
+      "description": "Block outbound Telnet after validation in monitor mode",
+      "action": "block",
+      "direction": "egress",
+      "protocol": "TCP",
+      "destination_ports": [23]
+    },
+    {
+      "id": "camera-default-deny",
+      "enabled": false,
+      "description": "Example MAC-scoped block; packet MACs may narrow denial but never authorize allow",
+      "action": "block",
+      "direction": "egress",
+      "source_macs": ["00:00:00:00:00:00"]
+    }
+  ]
+}

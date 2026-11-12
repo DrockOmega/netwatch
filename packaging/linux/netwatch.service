@@ -1,0 +1,58 @@
+# NetWatch headless service. Install layout assumed: code in /opt/netwatch with its venv,
+# runtime data in /var/lib/netwatch, system user "netwatch" (useradd --system).
+#
+# Capability scope (ambient approach, exact exposure):
+# - CAP_NET_RAW/CAP_NET_ADMIN are the only capabilities in the bounding set, granted as ambient.
+# - The supervisor/API process clears its effective set at start but keeps permitted+ambient so a
+#   restarted capture worker inherits them on exec; code execution in that process could re-raise them.
+# - Non-capture workers (db, core, suricata-eve) clear ambient/permitted/effective/inheritable and set
+#   no_new_privs before running worker code; they hold the capabilities only between exec and that drop.
+# - multiprocessing's resource tracker helper inherits them and does not drop.
+# Per-process state is reported in service health under worker_privileges.
+[Unit]
+Description=NetWatch network monitoring service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=netwatch
+Group=netwatch
+KillMode=mixed
+# Above RUNTIME_STOP_GRACE_SEC (60) so the ordered drain, not systemd, decides a stop's outcome.
+TimeoutStopSec=90
+WorkingDirectory=/opt/netwatch
+ExecStart=/opt/netwatch/.venv/bin/python -m netwatch_service --base-dir /var/lib/netwatch
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=netwatch
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/netwatch
+
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+SecureBits=noroot noroot-locked
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

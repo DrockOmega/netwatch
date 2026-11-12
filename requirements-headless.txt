@@ -1,0 +1,4 @@
+# Headless monitoring runtime; capture also requires Npcap/libpcap on the host.
+scapy==2.7.0
+numpy==2.4.6
+maxminddb==3.1.1

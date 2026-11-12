@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sV 10.0.0.0/24">
+<host starttime="1000" endtime="1100"><status state="up"/><address addr="10.0.0.5" addrtype="ipv4"/><address addr="00:11:22:33:44:55" addrtype="mac"/>
+<hostnames><hostname name="nas.lan" type="PTR"/></hostnames>
+<ports><port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="9.6"/></port>
+<port protocol="tcp" portid="23"><state state="open"/><service name="telnet"/></port>
+<port protocol="tcp" portid="25"><state state="closed"/></port></ports></host>
+<host starttime="1000" endtime="1100"><status state="up"/><address addr="203.0.113.9" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="80"><state state="open"/><service name="http"/></port></ports></host>
+<host><status state="down"/><address addr="10.0.0.77" addrtype="ipv4"/></host>
+</nmaprun>
